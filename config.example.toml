@@ -41,5 +41,6 @@ turn = true
 origins = ["https://four43.com"]
 max_players = 4
 max_rooms = 20
-public_rooms = false
+public_rooms = true   # joinable with the code alone
+list = "none"         # but never listed: the code is the only way in
 turn = true

@@ -990,3 +990,22 @@ async fn old_room_expires() {
     assert_eq!(peer.expect("room_closed").await, expected);
     assert_eq!(host.expect("room_closed").await, expected);
 }
+
+#[tokio::test]
+async fn list_none_hides_public_rooms() {
+    let config = format!(
+        "{}\n[apps.unlisted]\norigins = [\"https://unlisted.test\"]\npublic_rooms = true\nlist = \"none\"\n",
+        BASE_CONFIG
+    );
+    let s = start_with(&config, Some(TURN_SECRET)).await;
+    let mut host = s.client("unlisted", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+
+    let mut lister = s.client("unlisted", 1).await;
+    lister.send(json!({ "t": "list" })).await;
+    assert_eq!(lister.expect("rooms").await["rooms"], json!([]));
+
+    // Still joinable with the code alone.
+    lister.send(json!({ "t": "join", "code": room["code"] })).await;
+    lister.expect("joined").await;
+}

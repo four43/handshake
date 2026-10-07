@@ -112,6 +112,18 @@ pub struct TurnConfig {
     pub ttl_secs: u64,
 }
 
+/// What `list` returns for an app.
+#[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum ListMode {
+    /// Public rooms for the caller's version, nearby first (SPEC.md "Public listing").
+    #[default]
+    #[serde(rename = "all")]
+    All,
+    /// Nothing: a public room is joinable with its code, but its code is never listed.
+    #[serde(rename = "none")]
+    Hidden,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct AppConfig {
     pub origins: Vec<String>,
@@ -121,6 +133,8 @@ pub struct AppConfig {
     pub max_rooms: usize,
     #[serde(default)]
     pub public_rooms: bool,
+    #[serde(default)]
+    pub list: ListMode,
     #[serde(default)]
     pub turn: bool,
 }
@@ -730,6 +744,9 @@ impl App {
             }
 
             In::List => {
+                if app.list == ListMode::Hidden {
+                    return conns.send(conn, &json!({ "t": "rooms", "rooms": [] }));
+                }
                 let mut listed: Vec<&Room> = app_rooms
                     .values()
                     .filter(|r| {
@@ -1201,7 +1218,9 @@ mod tests {
         let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
         let tp = &cfg.apps["tractor-pickup"];
         assert_eq!(tp.origins, ["https://four43.com"]);
-        assert_eq!((tp.max_players, tp.max_rooms, tp.public_rooms, tp.turn), (4, 20, false, true));
+        assert_eq!((tp.max_players, tp.max_rooms, tp.public_rooms, tp.turn), (4, 20, true, true));
+        assert_eq!(tp.list, ListMode::Hidden);
+        assert_eq!(cfg.apps["pig-pens"].list, ListMode::All);
         assert_eq!(cfg.limits.grace_secs, 30);
     }
 
