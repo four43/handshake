@@ -310,3 +310,79 @@ test('a failed connection restarts ICE: the host re-offers, a guest asks the hos
   assert.deepEqual(await g.ws.next('signal'), { t: 'signal', to: 'H', data: { restart: true } });
   g.hs.close();
 });
+
+test('a dropped socket resumes the room and sends signals queued meanwhile', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const pc = env.pcs[0], closed = record(room, ['closed']);
+  ws.drop();
+  pc.ice({ candidate: 'late' }); // no socket: queued
+  const ws2 = await until(() => env.sockets[1]); // after the 250 ms backoff
+  assert.deepEqual(await ws2.next('resume'), { t: 'resume', token: 'rG' });
+  ws2.push({ t: 'joined', resumed: true, room: guestView({ resume: 'rG2' }) });
+  assert.deepEqual(await ws2.next('signal'), { t: 'signal', to: 'H', data: { candidate: { candidate: 'late' } } });
+  assert.equal(env.pcs.length, 1); // the WebRTC connection is untouched
+  assert.deepEqual(closed, []);
+
+  ws2.drop();
+  const ws3 = await until(() => env.sockets[2]);
+  assert.equal((await ws3.next('resume')).token, 'rG2'); // the newest resume token
+  hs.close();
+});
+
+test('a resume that finds no room closes it as lost', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const closed = record(room, ['closed']);
+  ws.drop();
+  const ws2 = await until(() => env.sockets[1]);
+  await ws2.next('resume');
+  ws2.push({ t: 'error', code: 'not_found', message: 'room no longer exists' });
+  await until(() => closed.length === 1);
+  assert.deepEqual(closed, [['closed', 'lost']]);
+  assert.equal(env.pcs[0].closed, true);
+  hs.close();
+});
+
+test('a host that resumes adds guests it missed and drops guests that left', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: true });
+  const left = record(room, ['peerLeft']);
+  ws.drop();
+  const ws2 = await until(() => env.sockets[1]);
+  await ws2.next('resume');
+  ws2.push({ t: 'joined', resumed: true, room: view({
+    resume: 'rH2',
+    peers: [{ id: 'H', name: 'Host', away: false, nearby: true }, { id: 'G2', name: 'Player', away: false, nearby: false }],
+  }) });
+  await until(() => room.peers.has('G2'));
+  assert.deepEqual([...room.peers.keys()], ['G2']);
+  assert.deepEqual(left, [['peerLeft', 'G', 'left']]);
+  assert.equal(env.pcs[0].closed, true);
+  hs.close();
+});
+
+test('an expiring session token is fetched again before the next hello', async () => {
+  const env = fakeEnv(); env.expiresIn = 30; // inside the 60 s margin: every connect fetches a new token
+  const { hs, ws } = await guesting(env);
+  const before = env.sessionCount;
+  ws.drop();
+  const ws2 = await until(() => env.sockets[1]);
+  const hello = await ws2.next('hello');
+  assert.equal(env.sessionCount, before + 1);
+  assert.equal(hello.token, `tok${before + 1}`);
+  hs.close();
+});
+
+test('a heartbeat with no answer treats the socket as dead and resumes', async () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  try {
+    const env = fakeEnv(), { hs, ws } = await guesting(env);
+    mock.timers.tick(25_000);
+    await ws.next('list');
+    mock.timers.tick(10_000); // no `rooms` reply
+    await until(() => ws.readyState === 3);
+    mock.timers.tick(250);
+    const ws2 = await until(() => env.sockets[1]);
+    assert.equal((await ws2.next('resume')).token, 'rG');
+    hs.close();
+  } finally { mock.timers.reset(); }
+});
