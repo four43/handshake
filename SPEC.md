@@ -231,6 +231,16 @@ Games built on Handshake should be host-authoritative with snapshot interpolatio
 - The interpolation buffer adapts to measured jitter: about 100 ms on a LAN, more over the internet (30–150 ms latency is typical).
 - Lockstep with `@dimforge/rapier3d-deterministic` is possible but less forgiving of Wi-Fi jitter. Start with snapshots.
 
+### Replicated objects: keyframes and diffs
+
+Shared state should be a registry of replicated objects, not one hand-written message per feature (this is the Unreal "replicated actor" / Unity `NetworkObject` / Quake snapshot pattern):
+
+- Each **kind** of object declares its fields (with quantization) and one **authority**: the host for world objects, the owning player for that player's avatar or vehicle. Only the authority changes an object.
+- Each object has an id and an **ownership number** that increases on every change of owner; receivers ignore data older than what they have.
+- The authority sends a **keyframe** (full state) on the reliable channel every couple of seconds and to every new joiner, and **diffs** (only changed objects, each with all its fields) on the unreliable channel in between. Diffs carry absolute values, so a lost diff needs no acknowledgement or resend: the next diff or keyframe heals it.
+- Requests (claim an object, hit something, deliver) are **events** on the reliable channel. Their result always comes back as replicated state, never as a separate answer, so a lost answer cannot leave peers disagreeing.
+- Each peer repairs its view at every keyframe (anything it is not the authority for takes the keyframe's value). Agreement after any loss is bounded by the keyframe interval.
+
 ### Channels and encoding
 
 - Two data channels per peer: `state` (unordered, `maxRetransmits: 0`) for snapshots and inputs, `events` (reliable, ordered) for joins, scoring and chat.
