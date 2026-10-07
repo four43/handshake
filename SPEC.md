@@ -112,7 +112,7 @@ A room is one host plus its joined peers, namespaced by app and pinned to a game
 - **Codes.** Codes use an unambiguous alphabet (no 0/O, 1/I/L) and are unique within an app.
 - **Private rooms** require the key. The share URL is `<game url>?r=<code>&k=<key>`, shown as a QR code for in-person play and passed to `navigator.share()` for remote friends. The QR is generated client-side.
 - **Public rooms** can be joined with the code alone and appear in the app's lobby listing, unless the app sets `list = "none"`.
-- **Peek.** `peek` looks at a room by code without joining it, so a game can show "Join this room?" first. It returns the room's name, player count, limit and whether it is locked or full. A peek counts as a join attempt for rate limits and metrics, so it cannot guess codes faster than `join`.
+- **Peek.** `peek` looks at a room by code without joining it, so a game can show "Join this room?" first. It returns the room's name, player count, limit and whether it is locked or full. A public room needs only the code; a private room also needs its key, exactly as `join` does (missing or wrong key: `bad_key`). A peek counts as a join attempt for rate limits and metrics, and its `not_found` and `bad_key` count as failed joins, so it cannot guess codes or keys faster than `join`.
 - **Version pinning.** A join from a different protocol version is rejected with `version_mismatch`, so cached old builds cannot join newer netcode.
 - **Topology.** Star only: the server forwards signaling between the host and each peer, never peer to peer.
 
@@ -174,7 +174,7 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `create` | `public`, `name?` (room), `player?`, `max_players?`, `meta?` | not in a room |
 | `join` | `code`, `key?`, `player?` | not in a room |
 | `resume` | `token` | not in a room |
-| `peek` | `code` | not in a room |
+| `peek` | `code`, `key?` (private rooms) | not in a room |
 | `list` |  | anyone |
 | `signal` | `to`, `data` | host ↔ peer only |
 | `lock` | `locked` | host |
@@ -272,7 +272,7 @@ room.on("hostAway", () => {});
 room.on("closed", (reason) => {});
 
 // Look before joining
-const info = await ph.peek(code);            // {code, name, players, maxPlayers, locked, full}
+const info = await ph.peek(code, key);       // key only for a private room; {code, name, players, maxPlayers, locked, full}
 
 // Joining
 const joined = await ph.joinRoom(code, key);   // or ph.joinFromUrl()
