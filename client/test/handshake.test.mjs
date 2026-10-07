@@ -148,3 +148,165 @@ test('connectionType reads relay at either end, and null without a selected pair
   assert.equal(connectionType(statsFor('host', 'relay')), 'relayed');
   assert.equal(connectionType(statsFor('srflx', 'host')), 'direct');
 });
+
+test('room events keep members up to date', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const log = record(room, ['members', 'peerAway', 'peerBack', 'peerLeft', 'meta']);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: false });
+  assert.deepEqual(room.members, [{ id: 'H', nearby: true, away: false }, { id: 'G', nearby: false, away: false }]);
+  ws.push({ t: 'peer_away', peer: 'G' });
+  assert.equal(room.members[1].away, true);
+  ws.push({ t: 'peer_back', peer: 'G' });
+  ws.push({ t: 'room_meta', meta: { farm: 7 }, locked: true });
+  assert.deepEqual([room.locked, room.meta], [true, { farm: 7 }]);
+  ws.push({ t: 'peer_left', peer: 'G', reason: 'timeout' });
+  assert.deepEqual(room.members.map(m => m.id), ['H']);
+  assert.deepEqual(log.map(e => e[0]), ['members', 'peerAway', 'members', 'peerBack', 'members', 'meta', 'peerLeft', 'members']);
+  assert.deepEqual(log.find(e => e[0] === 'peerLeft'), ['peerLeft', 'G', 'timeout']);
+  assert.equal(room.peers.has('G'), false);
+  assert.equal(env.pcs[0].closed, true);
+  hs.close();
+});
+
+test('guests hear when the host is away and back', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const log = record(room, ['hostAway', 'hostBack']);
+  ws.push({ t: 'host_away', grace_secs: 30 });
+  assert.equal(room.members[0].away, true);
+  ws.push({ t: 'host_back' });
+  assert.equal(room.members[0].away, false);
+  assert.deepEqual(log, [['hostAway', 30], ['hostBack']]);
+  hs.close();
+});
+
+test('lock, setMeta, kick and leave send their messages; leave closes the room', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const closed = record(room, ['closed']);
+  room.lock(true); room.setMeta({ farm: 1 }); room.kick('G'); room.leave();
+  assert.deepEqual(ws.sent.slice(2), [{ t: 'lock', locked: true }, { t: 'meta', meta: { farm: 1 } }, { t: 'kick', peer: 'G' }, { t: 'leave' }]);
+  assert.deepEqual(closed, [['closed', 'left']]);
+  const again = hs.createRoom();
+  await ws.next('create');
+  ws.push({ t: 'joined', resumed: false, room: view({ code: 'AAAAA' }) });
+  assert.equal((await again).code, 'AAAAA');
+  hs.close();
+});
+
+test('room_closed and kicked close the room with their reason', async () => {
+  const env = fakeEnv(), a = await hosting(env), log = record(a.room, ['closed']);
+  a.ws.push({ t: 'room_closed', reason: 'expired' });
+  assert.deepEqual(log, [['closed', 'expired']]);
+  a.hs.close();
+
+  const env2 = fakeEnv(), b = await guesting(env2), log2 = record(b.room, ['closed']);
+  b.ws.push({ t: 'kicked' });
+  assert.deepEqual(log2, [['closed', 'kicked']]);
+  assert.equal(env2.pcs[0].closed, true);
+  b.hs.close();
+});
+
+test('the host offers to each new guest over two channels and opens when both are open', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const opened = record(room, ['peer']);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: true });
+  const pc = env.pcs[0];
+  assert.deepEqual(pc.config, { iceServers: [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }] });
+  assert.deepEqual(pc.channels.map(c => [c.label, c.opts]), [['state', { ordered: false, maxRetransmits: 0 }], ['events', { ordered: true }]]);
+  assert.deepEqual(await ws.next('signal'), { t: 'signal', to: 'G', data: { sdp: { type: 'offer', sdp: 'offer1' } } });
+
+  pc.ice({ candidate: 'c1' });
+  assert.deepEqual((await ws.next('signal')).data, { candidate: { candidate: 'c1' } });
+
+  ws.push({ t: 'signal', from: 'G', data: { candidate: { candidate: 'g1' } } }); // before the answer: held
+  ws.push({ t: 'signal', from: 'G', data: { sdp: { type: 'answer', sdp: 'answer' } } });
+  await until(() => pc.candidates.length === 1);
+  assert.deepEqual(pc.remoteDescription, { type: 'answer', sdp: 'answer' });
+  assert.deepEqual(pc.candidates, [{ candidate: 'g1' }]);
+
+  pc.channels[0].open();
+  assert.equal(opened.length, 0);
+  pc.channels[1].open();
+  const peer = room.peers.get('G');
+  assert.deepEqual(opened, [['peer', peer]]);
+  assert.deepEqual([peer.open, peer.nearby, pc.channels[0].binaryType], [true, true, 'arraybuffer']);
+  hs.close();
+});
+
+test("a guest answers the host's offer and opens on the host's channels", async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const opened = record(room, ['peer']), pc = env.pcs[0];
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' } } });
+  assert.deepEqual(await ws.next('signal'), { t: 'signal', to: 'H', data: { sdp: { type: 'answer', sdp: 'answer' } } });
+  pc.remoteChannels();
+  pc.channels.forEach(c => c.open());
+  assert.equal(opened.length, 1);
+  assert.equal(room.peers.get('H').open, true);
+  hs.close();
+});
+
+test('send uses the state channel for binary and the events channel for reliable data', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: true });
+  const pc = env.pcs[0], peer = room.peers.get('G'), bytes = new Uint8Array([1, 2, 3]);
+  assert.equal(peer.send(bytes), false); // not open yet
+  pc.open();
+  const [stateCh, eventsCh] = pc.channels;
+  assert.equal(peer.send(bytes), true);
+  assert.equal(peer.send({ score: 1 }, { reliable: true }), true);
+  peer.send(bytes.buffer, { reliable: true });
+  assert.deepEqual([stateCh.sent, eventsCh.sent], [[bytes], ['{"score":1}', bytes.buffer]]);
+  assert.throws(() => peer.send({ score: 1 }), TypeError);
+
+  const got = record(peer, ['message']);
+  stateCh.receive(bytes.buffer);
+  eventsCh.receive('{"hi":true}');
+  eventsCh.receive('not json');
+  stateCh.receive('text on the state channel');
+  assert.deepEqual(got, [['message', bytes.buffer, { reliable: false }], ['message', { hi: true }, { reliable: true }]]);
+  hs.close();
+});
+
+test('relayUnlessNearby forces relay for players who are not nearby', async () => {
+  const env = fakeEnv(), h = await hosting(env, { relayUnlessNearby: true });
+  h.ws.push({ t: 'peer_joined', peer: 'N', name: 'Player', nearby: true });
+  h.ws.push({ t: 'peer_joined', peer: 'F', name: 'Player', nearby: false });
+  assert.deepEqual(env.pcs.map(pc => pc.config.iceTransportPolicy), [undefined, 'relay']);
+  h.hs.close();
+
+  const env2 = fakeEnv(), g = await guesting(env2, { relayUnlessNearby: true }); // guestView: G is not nearby
+  assert.equal(env2.pcs[0].config.iceTransportPolicy, 'relay');
+  g.hs.close();
+
+  const env3 = fakeEnv(), d = await guesting(env3); // option off: never forced
+  assert.equal(env3.pcs[0].config.iceTransportPolicy, undefined);
+  d.hs.close();
+});
+
+test('connectionType follows the selected candidate pair and emits type on change', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: false });
+  const pc = env.pcs[0], peer = room.peers.get('G'), types = record(peer, ['type']);
+  pc.setStats('relay'); pc.state('connected');
+  await until(() => peer.connectionType === 'relayed');
+  pc.setStats('host', 'srflx'); pc.state('connected');
+  await until(() => peer.connectionType === 'direct');
+  assert.deepEqual(types, [['type', 'relayed'], ['type', 'direct']]);
+  hs.close();
+});
+
+test('a failed connection restarts ICE: the host re-offers, a guest asks the host to', async () => {
+  const env = fakeEnv(), h = await hosting(env);
+  h.ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: true });
+  await h.ws.next('signal');
+  env.pcs[0].state('failed');
+  const again = await h.ws.next('signal');
+  assert.deepEqual([env.pcs[0].offers.at(-1), again.data.sdp.sdp], [{ iceRestart: true }, 'offer2']);
+  h.ws.push({ t: 'signal', from: 'G', data: { restart: true } });
+  assert.equal((await h.ws.next('signal')).data.sdp.sdp, 'offer3');
+  h.hs.close();
+
+  const env2 = fakeEnv(), g = await guesting(env2);
+  env2.pcs[0].state('failed');
+  assert.deepEqual(await g.ws.next('signal'), { t: 'signal', to: 'H', data: { restart: true } });
+  g.hs.close();
+});
