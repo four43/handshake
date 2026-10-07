@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "In",
+  "description": "A message from client to server, tagged by `t`.",
+  "oneOf": [
+    {
+      "description": "First message on a new socket, within 10 s. Answered by `welcome`.",
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "hello"
+        },
+        "token": {
+          "description": "Session token from `POST /session`.",
+          "type": "string"
+        },
+        "v": {
+          "description": "Signaling protocol version, currently `1`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "t",
+        "v",
+        "token"
+      ]
+    },
+    {
+      "description": "Create a room and become its host. Answered by `joined`. Not while in a room.",
+      "type": "object",
+      "properties": {
+        "max_players": {
+          "description": "Room size, host included, from 2 up to the app's `max_players` (the default).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "default": null,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "meta": {
+          "description": "Any JSON the lobby shows (map, mode...), at most 1 KB. The server never reads it.",
+          "default": null
+        },
+        "name": {
+          "description": "Room name shown in listings, cut to 32 characters. Defaults to `Room`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "player": {
+          "description": "The host's display name, cut to 32 characters. Defaults to `Host`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "public": {
+          "description": "Public rooms can be joined with the code alone and may be listed. Needs `public_rooms` on the app.",
+          "type": "boolean",
+          "default": false
+        },
+        "t": {
+          "type": "string",
+          "const": "create"
+        }
+      },
+      "required": [
+        "t"
+      ]
+    },
+    {
+      "description": "Join a room by code. Answered by `joined`. Not while in a room.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "The 5-character room code. Case-insensitive.",
+          "type": "string"
+        },
+        "key": {
+          "description": "The room key. Needed for a private room.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "player": {
+          "description": "Your display name, cut to 32 characters. Defaults to `Player`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "t": {
+          "type": "string",
+          "const": "join"
+        }
+      },
+      "required": [
+        "t",
+        "code"
+      ]
+    },
+    {
+      "description": "Take your place back after a dropped socket, within the grace period. Answered by `joined` with `resumed: true`.",
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "resume"
+        },
+        "token": {
+          "description": "The `resume` token from the last `joined`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "token"
+      ]
+    },
+    {
+      "description": "Look at a room without joining it. Answered by `room_info`. Counts as a join attempt for rate limits.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "The 5-character room code.",
+          "type": "string"
+        },
+        "key": {
+          "description": "The room key. Needed for a private room.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "t": {
+          "type": "string",
+          "const": "peek"
+        }
+      },
+      "required": [
+        "t",
+        "code"
+      ]
+    },
+    {
+      "description": "List the app's open public rooms for your version, nearby first. Answered by `rooms`.",
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "list"
+        }
+      },
+      "required": [
+        "t"
+      ]
+    },
+    {
+      "description": "Relay WebRTC signaling (SDP or ICE) to another member. Only between the host and a peer.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "Opaque signaling data, passed through untouched."
+        },
+        "t": {
+          "type": "string",
+          "const": "signal"
+        },
+        "to": {
+          "description": "The member's peer id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "to",
+        "data"
+      ]
+    },
+    {
+      "description": "Host only: stop (or allow) new joins.",
+      "type": "object",
+      "properties": {
+        "locked": {
+          "description": "`true` to lock.",
+          "type": "boolean"
+        },
+        "t": {
+          "type": "string",
+          "const": "lock"
+        }
+      },
+      "required": [
+        "t",
+        "locked"
+      ]
+    },
+    {
+      "description": "Host only: replace the room's metadata. Members get `room_meta`.",
+      "type": "object",
+      "properties": {
+        "meta": {
+          "description": "Any JSON, at most 1 KB."
+        },
+        "t": {
+          "type": "string",
+          "const": "meta"
+        }
+      },
+      "required": [
+        "t",
+        "meta"
+      ]
+    },
+    {
+      "description": "Host only: remove a peer. They can rejoin unless the room is locked.",
+      "type": "object",
+      "properties": {
+        "peer": {
+          "description": "The peer id to remove.",
+          "type": "string"
+        },
+        "t": {
+          "type": "string",
+          "const": "kick"
+        }
+      },
+      "required": [
+        "t",
+        "peer"
+      ]
+    },
+    {
+      "description": "Leave the room. When the host leaves, the room closes.",
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "leave"
+        }
+      },
+      "required": [
+        "t"
+      ]
+    }
+  ]
+}

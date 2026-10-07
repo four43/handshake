@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "description": "The server's `config.toml`. Secrets never go here: they come from the\nenvironment (`SESSION_SECRET`, `SESSION_SECRET_PREV`, `TURN_SECRET`).",
+  "type": "object",
+  "properties": {
+    "allow_localhost": {
+      "description": "Accept `http://localhost:*` and `http://127.0.0.1:*` origins for every app. For local development only.",
+      "type": "boolean",
+      "default": false
+    },
+    "apps": {
+      "description": "One `[apps.<id>]` table per game. The id is what the client passes as `app`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AppConfig"
+      }
+    },
+    "limits": {
+      "description": "Token lifetimes, grace periods, room ages and rate limits.",
+      "$ref": "#/$defs/Limits"
+    },
+    "listen": {
+      "description": "Address and port to listen on.",
+      "type": "string",
+      "default": "0.0.0.0:8080"
+    },
+    "trusted_proxies": {
+      "description": "Reverse proxies whose `X-Forwarded-For` is believed, as IP ranges. From any other peer the header is\nignored and the socket address is the client, so per-IP limits hold with or without a proxy in front.\nThe default covers a proxy on the same host or a private (Docker) network.",
+      "type": "array",
+      "default": [
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "turn": {
+      "description": "TURN relay offered to clients through `POST /turn`. Leave out to disable TURN for every app.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "AppConfig": {
+      "description": "One game.",
+      "type": "object",
+      "properties": {
+        "list": {
+          "description": "What `list` returns: `\"all\"` lists public rooms, `\"none\"` lists nothing.",
+          "$ref": "#/$defs/ListMode"
+        },
+        "max_players": {
+          "description": "Most members in a room, host included. A room can ask for fewer.",
+          "type": "integer",
+          "format": "uint8",
+          "default": 8,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "max_rooms": {
+          "description": "Most rooms open at once for this app.",
+          "type": "integer",
+          "format": "uint",
+          "default": 50,
+          "minimum": 0
+        },
+        "origins": {
+          "description": "Page origins allowed to use this app, e.g. `https://example.github.io`. An origin has no path.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "public_rooms": {
+          "description": "Allow public rooms, which can be joined with the code alone. Otherwise `create` with `public: true` fails with `public_disabled`.",
+          "type": "boolean",
+          "default": false
+        },
+        "turn": {
+          "description": "Hand out TURN credentials to this app's sessions. Needs a top-level `[turn]` table.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "origins"
+      ]
+    },
+    "Limits": {
+      "description": "Timeouts and rate limits, shared by all apps.",
+      "type": "object",
+      "properties": {
+        "app_failed_joins_per_min": {
+          "description": "Failed joins and peeks (`not_found`, `bad_key`) per app per minute, across all IPs.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 200,
+          "minimum": 0
+        },
+        "grace_secs": {
+          "description": "How long a member who dropped keeps their slot (and a host keeps the room) waiting for a resume, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        },
+        "idle_room_secs": {
+          "description": "A room whose host has been alone this long is closed, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1800,
+          "minimum": 0
+        },
+        "joins_per_min": {
+          "description": "Join and peek attempts per client IP per minute.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 20,
+          "minimum": 0
+        },
+        "room_max_age_secs": {
+          "description": "A room older than this is closed, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 43200,
+          "minimum": 0
+        },
+        "session_ttl_secs": {
+          "description": "Lifetime of a session token from `POST /session`, in seconds. The client renews it before it expires.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 900,
+          "minimum": 0
+        },
+        "sessions_per_min": {
+          "description": "Session tokens minted per client IP per minute.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 30,
+          "minimum": 0
+        }
+      }
+    },
+    "ListMode": {
+      "description": "What `list` returns for an app.",
+      "oneOf": [
+        {
+          "description": "Public rooms for the caller's version, nearby first (docs/specs/handshake-server.md \"Public listing\").",
+          "type": "string",
+          "const": "all"
+        },
+        {
+          "description": "Nothing: a public room is joinable with its code, but its code is never listed.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "TurnConfig": {
+      "description": "The companion coturn server. Its `static-auth-secret` must equal `TURN_SECRET`.",
+      "type": "object",
+      "properties": {
+        "ttl_secs": {
+          "description": "Lifetime of a TURN credential, in seconds.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 3600,
+          "minimum": 0
+        },
+        "urls": {
+          "description": "`stun:`, `turn:` and `turns:` URLs handed to clients, e.g. `turn:turn.example.com:3478?transport=udp`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "urls"
+      ]
+    }
+  }
+}

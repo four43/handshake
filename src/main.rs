@@ -73,6 +73,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cfg: Config = toml::from_str(&fs::read_to_string(&config_path)?)?;
+    if cfg.trust_proxy.is_some() {
+        warn!("`trust_proxy` is no longer used: X-Forwarded-For is read only from `trusted_proxies` (default: loopback and private networks)");
+    }
     if cfg.apps.is_empty() {
         warn!("no apps configured; every request will be rejected");
     }

@@ -66,29 +66,52 @@ const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O, 1/I/
 // Config
 // ---------------------------------------------------------------------------
 
+/// The server's `config.toml`. Secrets never go here: they come from the
+/// environment (`SESSION_SECRET`, `SESSION_SECRET_PREV`, `TURN_SECRET`).
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Config {
+    /// Address and port to listen on.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Reverse proxies whose `X-Forwarded-For` is believed, as IP ranges. From any other peer the header is
+    /// ignored and the socket address is the client, so per-IP limits hold with or without a proxy in front.
+    /// The default covers a proxy on the same host or a private (Docker) network.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<Cidr>,
+    /// Replaced by `trusted_proxies`; still read so the server can warn about it.
+    #[cfg_attr(test, schemars(skip))]
     #[serde(default)]
-    pub trust_proxy: bool,
+    pub trust_proxy: Option<bool>,
+    /// Accept `http://localhost:*` and `http://127.0.0.1:*` origins for every app. For local development only.
     #[serde(default)]
     pub allow_localhost: bool,
+    /// Token lifetimes, grace periods, room ages and rate limits.
     #[serde(default)]
     pub limits: Limits,
+    /// TURN relay offered to clients through `POST /turn`. Leave out to disable TURN for every app.
     pub turn: Option<TurnConfig>,
+    /// One `[apps.<id>]` table per game. The id is what the client passes as `app`.
     #[serde(default)]
     pub apps: HashMap<String, AppConfig>,
 }
 
+/// Timeouts and rate limits, shared by all apps.
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Limits {
+    /// Lifetime of a session token from `POST /session`, in seconds. The client renews it before it expires.
     pub session_ttl_secs: u64,
+    /// How long a member who dropped keeps their slot (and a host keeps the room) waiting for a resume, in seconds.
     pub grace_secs: u64,
+    /// A room older than this is closed, in seconds.
     pub room_max_age_secs: u64,
+    /// A room whose host has been alone this long is closed, in seconds.
     pub idle_room_secs: u64,
+    /// Session tokens minted per client IP per minute.
     pub sessions_per_min: u32,
+    /// Join and peek attempts per client IP per minute.
     pub joins_per_min: u32,
     /// Failed joins and peeks (`not_found`, `bad_key`) per app per minute, across all IPs.
     pub app_failed_joins_per_min: u32,
@@ -108,15 +131,20 @@ impl Default for Limits {
     }
 }
 
+/// The companion coturn server. Its `static-auth-secret` must equal `TURN_SECRET`.
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TurnConfig {
+    /// `stun:`, `turn:` and `turns:` URLs handed to clients, e.g. `turn:turn.example.com:3478?transport=udp`.
     pub urls: Vec<String>,
+    /// Lifetime of a TURN credential, in seconds.
     #[serde(default = "default_turn_ttl")]
     pub ttl_secs: u64,
 }
 
 /// What `list` returns for an app.
 #[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub enum ListMode {
     /// Public rooms for the caller's version, nearby first (docs/specs/handshake-server.md "Public listing").
     #[default]
@@ -127,19 +155,109 @@ pub enum ListMode {
     Hidden,
 }
 
+/// One game.
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct AppConfig {
+    /// Page origins allowed to use this app, e.g. `https://example.github.io`. An origin has no path.
     pub origins: Vec<String>,
+    /// Most members in a room, host included. A room can ask for fewer.
     #[serde(default = "default_max_players")]
     pub max_players: u8,
+    /// Most rooms open at once for this app.
     #[serde(default = "default_max_rooms")]
     pub max_rooms: usize,
+    /// Allow public rooms, which can be joined with the code alone. Otherwise `create` with `public: true` fails with `public_disabled`.
     #[serde(default)]
     pub public_rooms: bool,
+    /// What `list` returns: `"all"` lists public rooms, `"none"` lists nothing.
     #[serde(default)]
     pub list: ListMode,
+    /// Hand out TURN credentials to this app's sessions. Needs a top-level `[turn]` table.
     #[serde(default)]
     pub turn: bool,
+}
+
+/// An IP range such as `10.0.0.0/8` or `::1/128`. A bare address is a single host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        let (net, addr, bits) = match (self.net, ip) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => (u32::from(n) as u128, u32::from(a) as u128, 32),
+            (IpAddr::V6(n), IpAddr::V6(a)) => (u128::from(n), u128::from(a), 128),
+            _ => return false,
+        };
+        self.prefix == 0 || (net ^ addr) >> (bits - self.prefix as u32) == 0
+    }
+}
+
+impl std::str::FromStr for Cidr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("not an IP range: {s:?} (expected e.g. \"10.0.0.0/8\")");
+        let (addr, prefix) = match s.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+        let net: IpAddr = addr.parse().map_err(|_| bad())?;
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => max,
+            Some(p) => p.parse::<u8>().ok().filter(|p| *p <= max).ok_or_else(bad)?,
+        };
+        Ok(Cidr { net, prefix })
+    }
+}
+
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.net, self.prefix)
+    }
+}
+
+impl<'de> Deserialize<'de> for Cidr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// The schema test renders the default list, so it needs these; the server does not.
+#[cfg(test)]
+impl serde::Serialize for Cidr {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+#[cfg(test)]
+impl schemars::JsonSchema for Cidr {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Cidr".into()
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
+}
+
+fn default_trusted_proxies() -> Vec<Cidr> {
+    ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+        .iter()
+        .map(|s| s.parse().expect("valid default range"))
+        .collect()
 }
 
 pub fn default_listen() -> String {
@@ -245,56 +363,87 @@ struct Claims {
 // Client -> server messages
 // ---------------------------------------------------------------------------
 
+/// A message from client to server, tagged by `t`.
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum In {
+    /// First message on a new socket, within 10 s. Answered by `welcome`.
     Hello {
+        /// Signaling protocol version, currently `1`.
         #[allow(dead_code)]
         v: u32,
+        /// Session token from `POST /session`.
         #[allow(dead_code)]
         token: String,
     },
+    /// Create a room and become its host. Answered by `joined`. Not while in a room.
     Create {
+        /// Public rooms can be joined with the code alone and may be listed. Needs `public_rooms` on the app.
         #[serde(default)]
         public: bool,
+        /// Room name shown in listings, cut to 32 characters. Defaults to `Room`.
         #[serde(default)]
         name: Option<String>,
+        /// The host's display name, cut to 32 characters. Defaults to `Host`.
         #[serde(default)]
         player: Option<String>,
+        /// Room size, host included, from 2 up to the app's `max_players` (the default).
         #[serde(default)]
         max_players: Option<u8>,
+        /// Any JSON the lobby shows (map, mode...), at most 1 KB. The server never reads it.
         #[serde(default)]
         meta: Option<Value>,
     },
+    /// Join a room by code. Answered by `joined`. Not while in a room.
     Join {
+        /// The 5-character room code. Case-insensitive.
         code: String,
+        /// The room key. Needed for a private room.
         #[serde(default)]
         key: Option<String>,
+        /// Your display name, cut to 32 characters. Defaults to `Player`.
         #[serde(default)]
         player: Option<String>,
     },
+    /// Take your place back after a dropped socket, within the grace period. Answered by `joined` with `resumed: true`.
     Resume {
+        /// The `resume` token from the last `joined`.
         token: String,
     },
+    /// Look at a room without joining it. Answered by `room_info`. Counts as a join attempt for rate limits.
     Peek {
+        /// The 5-character room code.
         code: String,
+        /// The room key. Needed for a private room.
         #[serde(default)]
         key: Option<String>,
     },
+    /// List the app's open public rooms for your version, nearby first. Answered by `rooms`.
     List,
+    /// Relay WebRTC signaling (SDP or ICE) to another member. Only between the host and a peer.
     Signal {
+        /// The member's peer id.
         to: PeerId,
+        /// Opaque signaling data, passed through untouched.
         data: Value,
     },
+    /// Host only: stop (or allow) new joins.
     Lock {
+        /// `true` to lock.
         locked: bool,
     },
+    /// Host only: replace the room's metadata. Members get `room_meta`.
     Meta {
+        /// Any JSON, at most 1 KB.
         meta: Value,
     },
+    /// Host only: remove a peer. They can rejoin unless the room is locked.
     Kick {
+        /// The peer id to remove.
         peer: PeerId,
     },
+    /// Leave the room. When the host leaves, the room closes.
     Leave,
 }
 
@@ -518,18 +667,8 @@ impl App {
     }
 
     fn client_ip(&self, headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-        if self.cfg.trust_proxy {
-            // Caddy appends the real client address last.
-            let forwarded = headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-                .and_then(|v| v.trim().parse().ok());
-            if let Some(ip) = forwarded {
-                return ip;
-            }
-        }
-        addr.ip()
+        let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        forwarded_client(&self.cfg.trusted_proxies, xff, addr.ip())
     }
 
     // ---- socket lifecycle ----------------------------------------------
@@ -1143,6 +1282,26 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The client address for rate limits and `nearby`. `X-Forwarded-For` counts only when the peer is a
+/// trusted proxy. Proxies append, so the client is then the last entry that is not itself a trusted proxy.
+fn forwarded_client(trusted: &[Cidr], xff: Option<&str>, peer: IpAddr) -> IpAddr {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|c| c.contains(ip));
+    if !is_trusted(peer) {
+        return peer;
+    }
+    let mut client = peer;
+    for entry in xff.into_iter().flat_map(|v| v.rsplit(',')) {
+        let Ok(ip) = entry.trim().parse::<IpAddr>() else {
+            break; // anything left of an unreadable entry is unverifiable
+        };
+        client = ip;
+        if !is_trusted(ip) {
+            break;
+        }
+    }
+    client
+}
+
 fn rate_allow(
     rate: &mut RateMap,
     ip: IpAddr,
@@ -1486,10 +1645,91 @@ mod tests {
     }
 
     #[test]
+    fn cidr_parses_and_matches() {
+        let c = |s: &str| s.parse::<Cidr>().unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(c("10.0.0.0/8").contains(ip("10.1.2.3")));
+        assert!(!c("10.0.0.0/8").contains(ip("11.0.0.1")));
+        assert!(c("172.16.0.0/12").contains(ip("172.31.255.1")));
+        assert!(!c("172.16.0.0/12").contains(ip("172.32.0.1")));
+        assert!(c("192.0.2.1").contains(ip("192.0.2.1")), "a bare address is a /32");
+        assert!(!c("192.0.2.1").contains(ip("192.0.2.2")));
+        assert!(c("::1/128").contains(ip("::1")));
+        assert!(c("fc00::/7").contains(ip("fd12:3456::1")));
+        assert!(!c("fc00::/7").contains(ip("2001:db8::1")));
+        assert!(c("0.0.0.0/0").contains(ip("203.0.113.5")));
+        // Dual-stack sockets report IPv4 peers as IPv4-mapped IPv6.
+        assert!(c("10.0.0.0/8").contains(ip("::ffff:10.0.0.1")));
+        assert!(!c("10.0.0.0/8").contains(ip("2001:db8::1")), "families do not mix");
+        for bad in ["nope", "10.0.0.0/33", "::/129", "10.0.0.0/", "/8", "10.0.0.0/x"] {
+            assert!(bad.parse::<Cidr>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_default_and_validate() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let trusted = |s: &str| cfg.trusted_proxies.iter().any(|c| c.contains(ip(s)));
+        for t in ["127.0.0.1", "::1", "10.0.0.2", "172.17.0.1", "192.168.1.1", "fd00::1"] {
+            assert!(trusted(t), "{t}");
+        }
+        for u in ["203.0.113.5", "8.8.8.8", "2001:db8::1", "100.64.0.1"] {
+            assert!(!trusted(u), "{u}");
+        }
+        assert!(toml::from_str::<Config>("trusted_proxies = [\"nope\"]").is_err());
+    }
+
+    #[test]
+    fn forwarded_client_from_trusted_peers_only() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let private: Vec<Cidr> = ["127.0.0.0/8", "10.0.0.0/8"].iter().map(|s| s.parse().unwrap()).collect();
+        let f = |trusted: &[Cidr], xff: Option<&str>, peer: &str| forwarded_client(trusted, xff, ip(peer));
+
+        // An untrusted peer's header is ignored.
+        assert_eq!(f(&private, Some("198.51.100.1"), "203.0.113.5"), ip("203.0.113.5"));
+        assert_eq!(f(&[], Some("198.51.100.1"), "127.0.0.1"), ip("127.0.0.1"));
+        // A trusted peer: the last entry that is not itself a trusted proxy.
+        assert_eq!(f(&private, Some("198.51.100.1"), "10.0.0.2"), ip("198.51.100.1"));
+        assert_eq!(f(&private, Some("6.6.6.6, 198.51.100.1"), "10.0.0.2"), ip("198.51.100.1"));
+        assert_eq!(f(&private, Some("198.51.100.1, 10.0.0.9"), "10.0.0.2"), ip("198.51.100.1"));
+        // Every hop trusted: the first one (a client on the proxy's own network).
+        assert_eq!(f(&private, Some("10.0.0.7, 10.0.0.9"), "10.0.0.2"), ip("10.0.0.7"));
+        // No header, or one we cannot read: the peer.
+        assert_eq!(f(&private, None, "10.0.0.2"), ip("10.0.0.2"));
+        assert_eq!(f(&private, Some("garbage"), "10.0.0.2"), ip("10.0.0.2"));
+        // Stop at an unreadable entry rather than trust what is left of it.
+        assert_eq!(f(&private, Some("6.6.6.6, garbage, 10.0.0.9"), "10.0.0.2"), ip("10.0.0.9"));
+    }
+
+    #[test]
     fn ct_eq_compares_whole_strings() {
         assert!(ct_eq("abc", "abc"));
         assert!(!ct_eq("abc", "abd"));
         assert!(!ct_eq("abc", "ab"));
         assert!(ct_eq("", ""));
+    }
+
+    /// The docs site renders `site/schemas/*.json`. Regenerate with
+    /// `UPDATE_SCHEMAS=1 scripts/test.sh schemas_are_current`.
+    #[test]
+    fn schemas_are_current() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("site/schemas");
+        let schemas = [
+            ("config.json", schemars::schema_for!(Config)),
+            ("client-messages.json", schemars::schema_for!(In)),
+        ];
+        let update = std::env::var_os("UPDATE_SCHEMAS").is_some();
+        for (name, schema) in schemas {
+            let path = dir.join(name);
+            let json = serde_json::to_string_pretty(&schema).unwrap() + "\n";
+            if update {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&path, &json).unwrap();
+            } else {
+                let committed = std::fs::read_to_string(&path).unwrap_or_default();
+                assert!(committed == json, "{} is stale: run UPDATE_SCHEMAS=1 scripts/test.sh schemas_are_current", path.display());
+            }
+        }
     }
 }

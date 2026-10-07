@@ -3,7 +3,9 @@
 #   TURN_SECRET (must match coturn's static-auth-secret)
 
 listen = "0.0.0.0:8080"
-trust_proxy = true        # read client IP from X-Forwarded-For (Caddy in front)
+# X-Forwarded-For is believed only from these peers (your reverse proxy); from anyone else the
+# socket address is the client. The default, below, is loopback and private networks.
+# trusted_proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
 allow_localhost = false   # true only for local development
 
 [limits]

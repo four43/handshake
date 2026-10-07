@@ -11,6 +11,6 @@ tty=()
 exec docker run --rm "${tty[@]}" \
     -v "$PWD":/src -w /src \
     -v handshake-cargo:/usr/local/cargo/registry \
-    -v handshake-target:/target -e CARGO_TARGET_DIR=/target \
+    -v handshake-target:/target -e CARGO_TARGET_DIR=/target -e UPDATE_SCHEMAS \
     rust:1.91-slim-bookworm \
     cargo ${CARGO_CMD:-test} "$@"

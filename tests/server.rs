@@ -28,8 +28,9 @@ const WAIT: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_millis(300);
 
 /// Every app's allowed origin is `https://<app>.test`.
+/// Tests reach the server from 127.0.0.1, a trusted proxy by default, so they set the
+/// client IP with X-Forwarded-For.
 const BASE_CONFIG: &str = r#"
-trust_proxy = true
 
 [limits]
 grace_secs = 1
@@ -286,7 +287,7 @@ async fn session_origin_allowlist() {
 
 #[tokio::test]
 async fn session_allow_localhost() {
-    let config = BASE_CONFIG.replace("trust_proxy = true", "trust_proxy = true\nallow_localhost = true");
+    let config = format!("allow_localhost = true\n{BASE_CONFIG}");
     let s = start_with(&config, Some(TURN_SECRET)).await;
     for ok in ["http://localhost:5173", "http://127.0.0.1:8080", "https://game.test"] {
         assert_eq!(s.session("game", 1, Some(ok)).await.status(), 200, "{ok}");
@@ -320,6 +321,26 @@ async fn session_rate_limited_per_ip() {
     assert_eq!(res.json::<Value>().await.unwrap(), json!({ "error": "rate_limited" }));
     // Caddy appends the real client last; only that entry counts.
     assert_eq!(mint("203.0.113.5, 198.51.100.7").await.unwrap().status(), 200);
+    // Trusted proxies at the end of the chain are skipped: the client is the last untrusted entry.
+    assert_eq!(mint("203.0.113.5, 10.0.0.2").await.unwrap().status(), 429);
+}
+
+#[tokio::test]
+async fn forwarded_for_ignored_from_untrusted_peer() {
+    // With no trusted proxies, X-Forwarded-For is a client's own claim: limits use the socket address.
+    let config = format!("trusted_proxies = []\n{BASE_CONFIG}").replace("sessions_per_min = 1000", "sessions_per_min = 2");
+    let s = start_with(&config, Some(TURN_SECRET)).await;
+    let mint = |ip: &'static str| {
+        s.http
+            .post(s.url("/session"))
+            .header("origin", "https://game.test")
+            .header("x-forwarded-for", ip)
+            .json(&json!({ "app": "game", "version": 1 }))
+            .send()
+    };
+    assert_eq!(mint("203.0.113.5").await.unwrap().status(), 200);
+    assert_eq!(mint("203.0.113.6").await.unwrap().status(), 200);
+    assert_eq!(mint("203.0.113.7").await.unwrap().status(), 429, "spoofed addresses share the real one's bucket");
 }
 
 #[tokio::test]

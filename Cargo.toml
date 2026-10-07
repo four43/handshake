@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio-tungstenite = "0.24"
+schemars = "1"
 
 [profile.release]
 lto = true
