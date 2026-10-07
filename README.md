@@ -23,6 +23,14 @@ docker run --rm -p 8080:8080 -e SESSION_SECRET=$(openssl rand -hex 32) \
   -v "$PWD/config.toml:/etc/handshake/config.toml:ro" handshake
 ```
 
+## Images
+
+`.github/workflows/docker.yml` runs the tests above, builds the image, checks its health and runs the end-to-end test
+against that exact image, then pushes it to the GitHub Container Registry. Pull requests stop before the push.
+
+- A push to `main` publishes `ghcr.io/four43/handshake:<short hash>`, for example `:6fd9bf2`.
+- A git tag publishes `ghcr.io/four43/handshake:<tag>`, for example `git tag v1.0.0 && git push origin v1.0.0` gives `:v1.0.0`.
+
 ## Configure
 
 `config.example.toml` documents every key. Each game is an `[apps.<id>]` entry with its allowed
