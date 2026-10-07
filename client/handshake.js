@@ -31,7 +31,7 @@ class Emitter {
   }
   /** @param {string} name @param {(...args: any[]) => void} fn @returns {this} */
   off(name, fn) { this.#handlers.get(name)?.delete(fn); return this; }
-  /** @param {string} name @param {...any} args */
+  /** @internal @param {string} name @param {...any} args */
   emit(name, ...args) {
     for (const fn of [...(this.#handlers.get(name) ?? [])]) {
       try { fn(...args); } catch (e) { console.error('handshake listener', e); }
@@ -40,7 +40,18 @@ class Emitter {
 }
 
 const parse = text => { try { return JSON.parse(text); } catch { return null; } };
-const member = p => ({ id: p.id, nearby: !!p.nearby, away: !!p.away });
+const member = p => ({ id: p.id, name: p.name ?? '', nearby: !!p.nearby, away: !!p.away });
+
+/**
+ * A link to `href` that joins a room: `r` and `k` (when there is a key) set, the other parameters kept.
+ * @param {string} href @param {string} code @param {string | null} [key] @returns {string}
+ */
+export function shareUrl(href, code, key) {
+  const u = new URL(href);
+  u.searchParams.set('r', code);
+  if (key) u.searchParams.set('k', key); else u.searchParams.delete('k');
+  return u.href;
+}
 
 /**
  * 'relayed' when either end of the selected candidate pair is a TURN relay, 'direct' otherwise,
@@ -67,13 +78,14 @@ export class Handshake {
    * @param {string} o.server e.g. 'https://handshake.four43.com'
    * @param {string} o.app the app id in the server's config
    * @param {number} o.version the game's network protocol version; rooms only match the same version
+   * @param {string} [o.name] your display name, shown to the other players (the server cuts it to 32 characters)
    * @param {boolean} [o.relayUnlessNearby] connect only through TURN to a player who is not on the host's network
    * @param {any} [o.WebSocket] @param {any} [o.RTCPeerConnection] @param {any} [o.fetch] for tests
    * @param {boolean} [o.wakeLock] keep the screen on while in a room
    */
-  constructor({ server, app, version, relayUnlessNearby = false, WebSocket = globalThis.WebSocket,
+  constructor({ server, app, version, name, relayUnlessNearby = false, WebSocket = globalThis.WebSocket,
     RTCPeerConnection = globalThis.RTCPeerConnection, fetch = globalThis.fetch, wakeLock = true }) {
-    this.#o = { server: server.replace(/\/+$/, ''), app, version, relayUnlessNearby, WebSocket, RTCPeerConnection,
+    this.#o = { server: server.replace(/\/+$/, ''), app, version, name, relayUnlessNearby, WebSocket, RTCPeerConnection,
       fetch: (...a) => fetch(...a), wakeLock }; // a bare `fetch` must not be called as a method (Illegal invocation)
     globalThis.addEventListener?.('online', this.#onOnline);
     globalThis.document?.addEventListener('visibilitychange', this.#onVisible);
@@ -89,11 +101,23 @@ export class Handshake {
     return { code: m.code, name: m.name, players: m.players, maxPlayers: m.max_players, locked: m.locked, full: m.full };
   }
 
-  /** @param {{ public?: boolean, maxPlayers?: number, meta?: any }} [o] @returns {Promise<Room>} */
-  async createRoom({ public: pub = false, maxPlayers, meta } = {}) {
+  /**
+   * The app's open public rooms for your version, nearby first (empty when the app does not list rooms).
+   * @returns {Promise<{ code: string, name: string, players: number, maxPlayers: number, meta: any, nearby: boolean }[]>}
+   */
+  async listRooms() {
+    const m = await this.#request({ t: 'list' }, 'rooms');
+    return m.rooms.map(r => ({ code: r.code, name: r.name, players: r.players, maxPlayers: r.max_players, meta: r.meta ?? null, nearby: !!r.nearby }));
+  }
+
+  /**
+   * @param {{ public?: boolean, maxPlayers?: number, meta?: any, name?: string }} [o] `name` is the room's name in listings
+   * @returns {Promise<Room>}
+   */
+  async createRoom({ public: pub = false, maxPlayers, meta, name } = {}) {
     if (this.#room) throw new HandshakeError('already_in_room');
     await this.#iceServers();
-    const m = await this.#request({ t: 'create', public: pub, max_players: maxPlayers, meta }, 'joined');
+    const m = await this.#request({ t: 'create', public: pub, name, player: this.#o.name, max_players: maxPlayers, meta }, 'joined');
     return this.#enter(m.room);
   }
 
@@ -101,8 +125,20 @@ export class Handshake {
   async joinRoom(code, key) {
     if (this.#room) throw new HandshakeError('already_in_room');
     await this.#iceServers();
-    const m = await this.#request({ t: 'join', code: String(code).trim().toUpperCase(), key }, 'joined');
-    return this.#enter(m.room);
+    const m = await this.#request({ t: 'join', code: String(code).trim().toUpperCase(), key, player: this.#o.name }, 'joined');
+    return this.#enter(m.room, key);
+  }
+
+  /**
+   * Join the room a share link points to (`?r=<code>&k=<key>`, see `Room.shareUrl`). Resolves null when the URL
+   * has no room code, so a game can call it on every page load.
+   * @param {string} [url] defaults to the page's URL
+   * @returns {Promise<Room | null>}
+   */
+  async joinFromUrl(url = globalThis.location?.href) {
+    const params = url ? new URL(url).searchParams : null;
+    const code = params?.get('r');
+    return code ? this.joinRoom(code, params.get('k') ?? undefined) : null;
   }
 
   /** Leave any room, close the socket and stop. The object cannot be used again. */
@@ -208,12 +244,16 @@ export class Handshake {
     if (!this.#send(msg)) this.#queue.push(msg);
   }
 
-  /** Send `msg` and wait for a reply of type `want`. With `errors`, the first `error` that arrives rejects it. */
-  async #request(msg, want, errors = true) {
+  /**
+   * Send `msg` and wait for a reply of type `want` (for which `match` is true). With `errors`, the first `error` that
+   * arrives rejects it. A `pass` reply is also handled as usual. Without `connect`, a socket that is down rejects
+   * at once. `room` waiters fail when the room ends.
+   */
+  async #request(msg, want, { errors = true, match = null, pass = false, connect = true, room = false } = {}) {
     if (this.#closed) throw new HandshakeError('closed');
-    await this.#connect();
+    if (connect) await this.#connect();
     return new Promise((resolve, reject) => {
-      const w = { want, errors, resolve, reject };
+      const w = { want, errors, match, pass, room, resolve, reject };
       w.timer = setTimeout(() => { this.#drop(w); reject(new HandshakeError('timeout', `no ${want} reply`)); }, REQUEST_MS);
       this.#waiters.push(w);
       if (!this.#send(msg)) { this.#drop(w); reject(new HandshakeError('network', 'socket is not open')); }
@@ -237,8 +277,12 @@ export class Handshake {
       else console.warn('handshake:', m.code, m.message);
       return;
     }
-    const w = this.#waiters.find(x => x.want === m.t);
-    if (w) { this.#drop(w); return w.resolve(m); }
+    const w = this.#waiters.find(x => x.want === m.t && (!x.match || x.match(m)));
+    if (w) {
+      this.#drop(w);
+      w.resolve(m);
+      if (!w.pass) return;
+    }
     if (m.t === 'room_closed') return this.#exit(m.reason);
     if (m.t === 'kicked') return this.#exit('kicked');
     this.#room?._handle(m);
@@ -261,7 +305,7 @@ export class Handshake {
   #beatOnce() {
     const ws = this.#ws;
     if (!ws) return;
-    this.#request({ t: 'list' }, 'rooms', false).catch(() => {
+    this.#request({ t: 'list' }, 'rooms', { errors: false }).catch(() => {
       if (ws !== this.#ws) return;
       try { ws.close(); } catch { /* already closing */ }
       this.#onClose(ws); // do not wait for a close handshake on a dead socket
@@ -271,17 +315,18 @@ export class Handshake {
 
   // ---- room lifecycle -----------------------------------------------------
 
-  #enter(r) {
+  #enter(r, key) {
     this.#resume = r.resume;
     const link = {
       send: msg => this.#send(msg),
+      control: (msg, want, match) => this.#request(msg, want, { match, pass: true, connect: false, room: true }),
       signal: (to, data) => this.#signal(to, data),
       leave: () => { this.#send({ t: 'leave' }); this.#exit('left'); },
       ice: () => this.#ice,
       RTCPeerConnection: this.#o.RTCPeerConnection,
       relayUnlessNearby: this.#o.relayUnlessNearby,
     };
-    this.#room = new Room(link, r);
+    this.#room = new Room(link, r, key);
     this.#wake(true);
     return this.#room;
   }
@@ -296,6 +341,7 @@ export class Handshake {
     clearTimeout(this.#retryTimer);
     this.#retryTimer = null;
     this.#wake(false);
+    for (const w of this.#waiters.filter(x => x.room)) { this.#drop(w); w.reject(new HandshakeError('closed')); }
     room._close(reason);
   }
 
@@ -355,36 +401,69 @@ export class Handshake {
   }
 }
 
-/** One room: its members (from the server) and its peer connections (host <-> each guest). */
+/**
+ * One room: its members (from the server) and its peer connections (host <-> each guest).
+ * Returned by `createRoom`, `joinRoom` and `joinFromUrl`.
+ *
+ * Events (`room.on(name, fn)`):
+ * - `peer` (peer: Peer): a peer connection opened; the host gets one per guest, a guest one for the host
+ * - `members` (members): the member list changed
+ * - `peerAway` (id) / `peerBack` (id): a member's socket dropped / resumed
+ * - `peerLeft` (id, reason): a member left; reason is `left`, `timeout` or `kicked`
+ * - `hostAway` (graceSecs) / `hostBack` (): the host's socket dropped / resumed
+ * - `meta` ({ meta, locked }): the host changed the room's meta or lock
+ * - `closed` (reason): you are out of the room: `left`, `host_left`, `host_gone`, `kicked`, `expired`, `idle`,
+ *   `replaced` or `lost`
+ * @hideconstructor
+ */
 class Room extends Emitter {
   #link;
 
-  constructor(link, r) {
+  constructor(link, r, key) {
     super();
     this.#link = link;
     /** @type {string} */ this.code = r.code;
-    /** @type {string | null} */ this.key = r.key ?? null;
+    /** @type {string} */ this.name = r.name;
+    /** @type {string | null} the private key: from the server for the host, the one you joined with for a guest */
+    this.key = r.key ?? key ?? null;
     /** @type {boolean} */ this.isHost = !!r.is_host;
     /** @type {string} */ this.you = r.you;
     /** @type {string} */ this.hostId = r.host;
     /** @type {boolean} */ this.locked = !!r.locked;
     /** @type {any} */ this.meta = r.meta ?? null;
-    /** @type {{ id: string, nearby: boolean, away: boolean }[]} */ this.members = r.peers.map(member);
+    /** @type {{ id: string, name: string, nearby: boolean, away: boolean }[]} */ this.members = r.peers.map(member);
     /** @type {Map<string, Peer>} */ this.peers = new Map();
-    this.closed = false;
+    /** @type {boolean} true after `closed` */ this.closed = false;
     if (!this.isHost) this.#addPeer(this.hostId, false); // the host sends the offer
   }
 
-  /** @param {boolean} locked */ lock(locked) { this.#link.send({ t: 'lock', locked: !!locked }); }
-  /** @param {any} meta at most 1 KB of JSON */ setMeta(meta) { this.#link.send({ t: 'meta', meta }); }
-  /** @param {string} peerId */ kick(peerId) { this.#link.send({ t: 'kick', peer: peerId }); }
+  /** A link that joins this room (see `joinFromUrl`); null outside a browser page. @type {string | null} */
+  get shareUrl() {
+    const href = globalThis.location?.href;
+    return href ? shareUrl(href, this.code, this.key) : null;
+  }
+
+  // Host controls resolve once the server has applied them and reject with a HandshakeError: `not_host`, a server
+  // error, `network` while the socket is down (nothing is queued), `timeout`, or `closed` if the room ends first.
+
+  /** Host only: stop (or allow) new joins. @param {boolean} locked @returns {Promise<void>} */
+  lock(locked) { return this.#control({ t: 'lock', locked: !!locked }, 'room_meta', m => !!m.locked === !!locked); }
+  /** Host only: replace the room's meta. @param {any} meta at most 1 KB of JSON @returns {Promise<void>} */
+  setMeta(meta) { return this.#control({ t: 'meta', meta }, 'room_meta'); }
+  /** Host only: remove a peer; it can rejoin unless the room is locked. @param {string} peerId @returns {Promise<void>} */
+  kick(peerId) { return this.#control({ t: 'kick', peer: peerId }, 'peer_left', m => m.peer === peerId); }
   leave() { this.#link.leave(); }
+
+  async #control(msg, want, match) {
+    if (!this.isHost) throw new HandshakeError('not_host');
+    await this.#link.control(msg, want, match);
+  }
 
   /** @internal a server message for this room */
   _handle(m) {
     switch (m.t) {
       case 'peer_joined':
-        this.members.push({ id: m.peer, nearby: !!m.nearby, away: false });
+        this.members.push({ id: m.peer, name: m.name ?? '', nearby: !!m.nearby, away: false });
         this.emit('members', this.members);
         if (this.isHost) this.#addPeer(m.peer, true);
         break;
@@ -416,6 +495,8 @@ class Room extends Emitter {
       this.emit('peerLeft', x.id, 'left');
     }
     this.members = r.peers.map(member);
+    this.name = r.name;
+    for (const x of this.members) { const peer = this.peers.get(x.id); if (peer) peer.name = x.name; }
     this.locked = !!r.locked;
     this.meta = r.meta ?? null;
     if (this.isHost) for (const x of this.members) if (x.id !== this.you && !this.peers.has(x.id)) this.#addPeer(x.id, true);
@@ -436,7 +517,7 @@ class Room extends Emitter {
   #addPeer(id, initiator) {
     // Relay policy uses the guest's flag: the host's view of the guest, or the guest's own entry.
     const nearby = !!this.members.find(x => x.id === (initiator ? id : this.you))?.nearby;
-    const peer = new Peer(this.#link, id, nearby, initiator,
+    const peer = new Peer(this.#link, id, this.members.find(x => x.id === id)?.name ?? '', nearby, initiator,
       () => this.emit('peer', peer),
       () => { if (this.peers.get(id) === peer) this.peers.delete(id); });
     this.peers.set(id, peer);
@@ -450,17 +531,26 @@ class Room extends Emitter {
   }
 }
 
-/** One WebRTC connection with its `state` and `events` channels. */
+/**
+ * One WebRTC connection with its `state` and `events` channels. Delivered by the room's `peer` event.
+ *
+ * Events (`peer.on(name, fn)`):
+ * - `message` (data, { reliable }): an ArrayBuffer, or a parsed JSON value from the reliable channel
+ * - `type` ('direct' | 'relayed'): the connection type changed
+ * - `close` (): the connection closed
+ * @hideconstructor
+ */
 class Peer extends Emitter {
   #link; #pc; #initiator; #opened; #gone; #state = null; #events = null; #pending = []; #chain = Promise.resolve(); #stats = null;
 
-  constructor(link, id, nearby, initiator, opened, gone) {
+  constructor(link, id, name, nearby, initiator, opened, gone) {
     super();
     this.#link = link;
     this.#initiator = initiator;
     this.#opened = opened;
     this.#gone = gone;
     /** @type {string} */ this.id = id;
+    /** @type {string} the player's display name */ this.name = name;
     /** @type {boolean} */ this.nearby = nearby;
     /** @type {'direct' | 'relayed' | null} */ this.connectionType = null;
     /** @type {boolean} */ this.open = false;

@@ -1,7 +1,7 @@
 // Unit tests for handshake.js against a scripted fake server and fake WebRTC (see fakes.js).
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { Handshake, HandshakeError, connectionType } from '../handshake.js';
+import { Handshake, HandshakeError, connectionType, shareUrl } from '../handshake.js';
 import { fakeEnv, until, statsFor } from './fakes.js';
 
 const SERVER = 'https://handshake.test';
@@ -47,7 +47,7 @@ test('createRoom fetches a session and TURN, says hello, and returns the room', 
     [room.code, room.key, room.isHost, room.you, room.hostId, room.locked, room.meta],
     ['K7MX2', 'kk', true, 'H', 'H', false, null],
   );
-  assert.deepEqual(room.members, [{ id: 'H', nearby: true, away: false }]);
+  assert.deepEqual(room.members, [{ id: 'H', name: 'Host', nearby: true, away: false }]);
   hs.close();
 });
 
@@ -153,7 +153,7 @@ test('room events keep members up to date', async () => {
   const env = fakeEnv(), { hs, ws, room } = await hosting(env);
   const log = record(room, ['members', 'peerAway', 'peerBack', 'peerLeft', 'meta']);
   ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: false });
-  assert.deepEqual(room.members, [{ id: 'H', nearby: true, away: false }, { id: 'G', nearby: false, away: false }]);
+  assert.deepEqual(room.members, [{ id: 'H', name: 'Host', nearby: true, away: false }, { id: 'G', name: 'Player', nearby: false, away: false }]);
   ws.push({ t: 'peer_away', peer: 'G' });
   assert.equal(room.members[1].away, true);
   ws.push({ t: 'peer_back', peer: 'G' });
@@ -179,12 +179,14 @@ test('guests hear when the host is away and back', async () => {
   hs.close();
 });
 
-test('lock, setMeta, kick and leave send their messages; leave closes the room', async () => {
+test('lock, setMeta, kick and leave send their messages; leave closes the room and fails pending controls', async () => {
   const env = fakeEnv(), { hs, ws, room } = await hosting(env);
   const closed = record(room, ['closed']);
-  room.lock(true); room.setMeta({ farm: 1 }); room.kick('G'); room.leave();
+  const pending = [room.lock(true), room.setMeta({ farm: 1 }), room.kick('G')];
+  room.leave();
   assert.deepEqual(ws.sent.slice(2), [{ t: 'lock', locked: true }, { t: 'meta', meta: { farm: 1 } }, { t: 'kick', peer: 'G' }, { t: 'leave' }]);
   assert.deepEqual(closed, [['closed', 'left']]);
+  for (const p of pending) await assert.rejects(p, { code: 'closed' });
   const again = hs.createRoom();
   await ws.next('create');
   ws.push({ t: 'joined', resumed: false, room: view({ code: 'AAAAA' }) });
@@ -384,5 +386,159 @@ test('a heartbeat with no answer treats the socket as dead and resumes', async (
     const ws2 = await until(() => env.sockets[1]);
     assert.equal((await ws2.next('resume')).token, 'rG');
     hs.close();
+  } finally { mock.timers.reset(); }
+});
+
+test('names: yours goes as player on create and join, the room gets one, members and peers carry theirs', async () => {
+  const env = fakeEnv(), hs = make(env, { name: 'Seth' }), pending = hs.createRoom({ name: 'Pig pens' });
+  const ws = await until(() => env.sockets[0]);
+  assert.deepEqual(await ws.next('create'), { t: 'create', public: false, name: 'Pig pens', player: 'Seth' });
+  ws.push({ t: 'joined', resumed: false, room: view({ name: 'Pig pens', peers: [{ id: 'H', name: 'Seth', away: false, nearby: true }] }) });
+  const room = await pending;
+  assert.equal(room.name, 'Pig pens');
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Ada', nearby: true });
+  assert.deepEqual(room.members.map(m => m.name), ['Seth', 'Ada']);
+  assert.equal(room.peers.get('G').name, 'Ada');
+  hs.close();
+
+  const env2 = fakeEnv(), hs2 = make(env2, { name: 'Ada' }), joining = hs2.joinRoom('K7MX2', 'kk');
+  const ws2 = await until(() => env2.sockets[0]);
+  assert.deepEqual(await ws2.next('join'), { t: 'join', code: 'K7MX2', key: 'kk', player: 'Ada' });
+  ws2.push({ t: 'joined', resumed: false, room: guestView() });
+  const g = await joining;
+  assert.equal(g.peers.get('H').name, 'Host'); // a guest's one peer is the host
+  hs2.close();
+});
+
+test('a resume refreshes member names', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  ws.drop();
+  const ws2 = await until(() => env.sockets[1]);
+  await ws2.next('resume');
+  ws2.push({ t: 'joined', resumed: true, room: guestView({
+    name: 'Renamed', peers: [{ id: 'H', name: 'Host2', away: false, nearby: true }, { id: 'G', name: 'Player', away: false, nearby: false }],
+  }) });
+  await until(() => room.members[0].name === 'Host2');
+  assert.equal(room.name, 'Renamed');
+  hs.close();
+});
+
+test('listRooms maps the public list; replies are matched in order', async () => {
+  const env = fakeEnv(), hs = make(env), first = hs.listRooms(), second = hs.listRooms();
+  const ws = await until(() => env.sockets[0]);
+  await ws.next('list'); await ws.next('list');
+  ws.push({ t: 'rooms', rooms: [{ code: 'AAAAA', name: 'Pens', players: 2, max_players: 4, meta: { map: 1 }, nearby: true }] });
+  ws.push({ t: 'rooms', rooms: [] });
+  assert.deepEqual(await first, [{ code: 'AAAAA', name: 'Pens', players: 2, maxPlayers: 4, meta: { map: 1 }, nearby: true }]);
+  assert.deepEqual(await second, []);
+  assert.deepEqual(env.posts.map(p => p.path), ['/session']); // no TURN for a list
+  hs.close();
+});
+
+test('shareUrl sets r and k on a page URL and keeps its other params', () => {
+  assert.equal(shareUrl('https://g.test/play/?lang=fi#top', 'K7MX2', 'kk'), 'https://g.test/play/?lang=fi&r=K7MX2&k=kk#top');
+  assert.equal(shareUrl('https://g.test/?r=OLD&k=old', 'K7MX2', null), 'https://g.test/?r=K7MX2');
+});
+
+test('room.shareUrl uses the page location; guests keep the key they joined with', async () => {
+  globalThis.location = { href: 'https://g.test/play/' };
+  try {
+    const env = fakeEnv(), h = await hosting(env);
+    assert.equal(h.room.shareUrl, 'https://g.test/play/?r=K7MX2&k=kk');
+    h.hs.close();
+
+    const env2 = fakeEnv(), hs = make(env2), joining = hs.joinRoom('K7MX2', 'kk');
+    const ws = await until(() => env2.sockets[0]);
+    await ws.next('join');
+    ws.push({ t: 'joined', resumed: false, room: guestView() }); // key: null for a guest
+    const room = await joining;
+    assert.equal(room.key, 'kk');
+    assert.equal(room.shareUrl, 'https://g.test/play/?r=K7MX2&k=kk');
+    hs.close();
+  } finally { delete globalThis.location; }
+
+  const env3 = fakeEnv(), g = await guesting(env3); // no location (not a browser): no share URL
+  assert.equal(g.room.shareUrl, null);
+  g.hs.close();
+});
+
+test('joinFromUrl joins with r and k, and resolves null without r', async () => {
+  const env = fakeEnv(), hs = make(env);
+  assert.equal(await hs.joinFromUrl('https://g.test/play/?lang=fi'), null);
+  assert.equal(env.sockets.length, 0); // nothing opened
+  const joining = hs.joinFromUrl('https://g.test/play/?r=k7mx2&k=kk');
+  const ws = await until(() => env.sockets[0]);
+  assert.deepEqual(await ws.next('join'), { t: 'join', code: 'K7MX2', key: 'kk' });
+  ws.push({ t: 'joined', resumed: false, room: guestView() });
+  assert.equal((await joining).code, 'K7MX2');
+  hs.close();
+});
+
+test('lock and setMeta resolve on the room_meta they cause, which still updates the room', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const metas = record(room, ['meta']);
+  const locking = room.lock(true), meta = room.setMeta({ map: 2 });
+  await ws.next('lock'); await ws.next('meta');
+  ws.push({ t: 'room_meta', meta: null, locked: true });
+  ws.push({ t: 'room_meta', meta: { map: 2 }, locked: true });
+  await locking; await meta;
+  assert.deepEqual([room.locked, room.meta], [true, { map: 2 }]);
+  assert.equal(metas.length, 2);
+  hs.close();
+});
+
+test('host controls reject with the server error, not a console warning', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const big = room.setMeta({ huge: true });
+  await ws.next('meta');
+  ws.push({ t: 'error', code: 'meta_too_large', message: 'meta must be 1 KB or less' });
+  await assert.rejects(big, e => e instanceof HandshakeError && e.code === 'meta_too_large');
+
+  const gone = room.kick('X');
+  await ws.next('kick');
+  ws.push({ t: 'error', code: 'peer_unavailable', message: 'no such peer' });
+  await assert.rejects(gone, { code: 'peer_unavailable' });
+  hs.close();
+});
+
+test('kick resolves when that peer has left', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  ws.push({ t: 'peer_joined', peer: 'G', name: 'Ada', nearby: true });
+  ws.push({ t: 'peer_joined', peer: 'G2', name: 'Bo', nearby: true });
+  const left = record(room, ['peerLeft']);
+  let done = false;
+  const kicking = room.kick('G2').then(() => { done = true; });
+  await ws.next('kick');
+  ws.push({ t: 'peer_left', peer: 'G', reason: 'left' }); // someone else
+  await new Promise(r => setImmediate(r));
+  assert.equal(done, false);
+  ws.push({ t: 'peer_left', peer: 'G2', reason: 'kicked' });
+  await kicking;
+  assert.deepEqual(left, [['peerLeft', 'G', 'left'], ['peerLeft', 'G2', 'kicked']]);
+  hs.close();
+});
+
+test('host controls: not_host for a guest, network while the socket is down, timeout without a reply', async () => {
+  const env = fakeEnv(), g = await guesting(env);
+  await assert.rejects(g.room.lock(true), { code: 'not_host' });
+  await assert.rejects(g.room.setMeta({}), { code: 'not_host' });
+  await assert.rejects(g.room.kick('H'), { code: 'not_host' });
+  assert.equal(g.ws.sent.some(m => ['lock', 'meta', 'kick'].includes(m.t)), false);
+  g.hs.close();
+
+  const env2 = fakeEnv(), h = await hosting(env2);
+  h.ws.drop();
+  await assert.rejects(h.room.lock(true), { code: 'network' });
+  assert.equal(env2.sockets.length, 1); // no fresh socket outside the resume
+  h.hs.close();
+
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  try {
+    const env3 = fakeEnv(), t = await hosting(env3);
+    const locking = t.room.lock(true);
+    await t.ws.next('lock');
+    mock.timers.tick(10_000);
+    await assert.rejects(locking, { code: 'timeout' });
+    t.hs.close();
   } finally { mock.timers.reset(); }
 });
