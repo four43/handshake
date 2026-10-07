@@ -1,10 +1,10 @@
-# Peer Helper — Signaling Server Spec
+# Handshake — Signaling Server Spec
 
 Oct 5, 2026 · @Seth Miller
 
 ## Overview
 
-Peer Helper is a small self-hosted Rust server that matches players into rooms and relays WebRTC signaling, then gets out of the way. Game traffic flows peer-to-peer over WebRTC data channels, host-authoritative in a star topology. The server never sees game state.
+Handshake is a small self-hosted Rust server that matches players into rooms and relays WebRTC signaling, then gets out of the way. Game traffic flows peer-to-peer over WebRTC data channels, host-authoritative in a star topology. The server never sees game state.
 
 Target games are Rapier + three.js browser games played on iPhones and iPads, hosted statically on GitHub Pages. Players may share a LAN or be on entirely different networks, including cellular.
 
@@ -29,7 +29,7 @@ Out of scope:
 The game is static on GitHub Pages; one self-hosted Docker host runs Caddy, the Rust server and coturn. Only signaling and TURN credentials touch the Rust server.
 
 - **Caddy** terminates TLS for `https://signal.<domain>` with automatic certificates and proxies `/session`, `/turn` and `/ws` to the Rust container on port 8080. `/metrics` is not proxied.
-- **peer-helper** is a single Rust binary (axum + tokio) in a distroless image. It reads `config.toml` and secrets from environment variables.
+- **handshake** is a single Rust binary (axum + tokio) in a distroless image. It reads `config.toml` and secrets from environment variables.
 - **coturn** runs with `network_mode: host`, because large UDP port ranges map badly through Docker. Set `external-ip` if the box is behind NAT, narrow the relay range (for example 49160–49200), and reuse Caddy's certificate for `turns:` on 443.
 
 ```yaml
@@ -39,11 +39,11 @@ services:
     ports: ["80:80", "443:443"]
     volumes: ["./Caddyfile:/etc/caddy/Caddyfile", "caddy_data:/data"]
   signal:
-    build: ./peer-helper
+    build: ./handshake
     environment:
       SESSION_SECRET: ${SESSION_SECRET}
       TURN_SECRET: ${TURN_SECRET}
-    volumes: ["./config.toml:/etc/peer-helper/config.toml:ro"]
+    volumes: ["./config.toml:/etc/handshake/config.toml:ro"]
   coturn:
     image: coturn/coturn
     network_mode: host
@@ -73,13 +73,23 @@ max_players = 4
 max_rooms = 20
 public_rooms = false
 turn = true
+
+[apps.tractor-pickup]
+origins = ["https://four43.com"]
+max_players = 4
+max_rooms = 20
+public_rooms = true   # joinable with the code alone
+list = "none"         # but never listed: the code is the only way in
+turn = true
 ```
+
+`list` controls what `list` returns for the app: `"all"` (default) returns its public rooms as described under Public listing; `"none"` returns an empty list, so a public room's code stays secret. Phase 2 adds `"knock"` (see Knock to join).
 
 ### Layers
 
 1. **Origin allowlist.** `POST /session` and the WebSocket upgrade both require an `Origin` header matching the app's list. Browsers cannot forge `Origin`; scripts can.
 2. **Session token.** `/session` returns an HMAC-SHA256-signed token carrying app ID, protocol version and expiry (default 15 minutes). The WebSocket `hello` and `/turn` both require it.
-3. **Rate limits.** Per-IP limits on session minting and join attempts blunt scripted abuse and code brute-forcing.
+3. **Rate limits.** Per-IP limits on session minting and join attempts blunt scripted abuse and code brute-forcing. A per-app limit on failed joins and peeks (`not_found`, `bad_key`) across all IPs stops a guesser with many addresses; when it is hit, joins and peeks for that app return `rate_limited` until the minute rolls over.
 4. **TURN quota.** TURN usernames encode expiry and app ID, so coturn logs attribute relay usage per app. Cloudflare Turnstile before `/session` is the upgrade path if abuse appears.
 
 ### Path-based apps share an origin
@@ -101,13 +111,14 @@ A room is one host plus its joined peers, namespaced by app and pinned to a game
 - **Create.** The host sends `create` with `public`, an optional `name`, `max_players` and `meta`. The server returns a 5-character join code, a private key, the host's peer ID and a resume token.
 - **Codes.** Codes use an unambiguous alphabet (no 0/O, 1/I/L) and are unique within an app.
 - **Private rooms** require the key. The share URL is `<game url>?r=<code>&k=<key>`, shown as a QR code for in-person play and passed to `navigator.share()` for remote friends. The QR is generated client-side.
-- **Public rooms** can be joined with the code alone and appear in the app's lobby listing.
+- **Public rooms** can be joined with the code alone and appear in the app's lobby listing, unless the app sets `list = "none"`.
+- **Peek.** `peek` looks at a room by code without joining it, so a game can show "Join this room?" first. It returns the room's name, player count, limit and whether it is locked or full. A peek counts as a join attempt for rate limits and metrics, so it cannot guess codes faster than `join`.
 - **Version pinning.** A join from a different protocol version is rejected with `version_mismatch`, so cached old builds cannot join newer netcode.
 - **Topology.** Star only: the server forwards signaling between the host and each peer, never peer to peer.
 
 ### Public listing
 
-`list` returns the app's public rooms for the caller's version that are unlocked and not full, capped at 50. Each entry has `nearby: true` when the host's public IP matches the caller's (IPv4 exact, IPv6 by /64 prefix). Nearby rooms sort first, then newest. Room names are capped at 32 characters.
+`list` returns the app's public rooms for the caller's version that are unlocked and not full, capped at 50. Each entry has `nearby: true` when the host's public IP matches the caller's (IPv4 exact, IPv6 by /64 prefix). Rooms whose host is away are left out. Nearby rooms sort first, then newest. Room names are capped at 32 characters.
 
 ### Host controls
 
@@ -163,6 +174,7 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `create` | `public`, `name?` (room), `player?`, `max_players?`, `meta?` | not in a room |
 | `join` | `code`, `key?`, `player?` | not in a room |
 | `resume` | `token` | not in a room |
+| `peek` | `code` | not in a room |
 | `list` |  | anyone |
 | `signal` | `to`, `data` | host ↔ peer only |
 | `lock` | `locked` | host |
@@ -177,7 +189,8 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `welcome` | `v` | after a valid `hello` |
 | `joined` | `room` (see below), `resumed` | after `create`, `join` or `resume` |
 | `rooms` | `rooms: [{code, name, players, max_players, meta, nearby}]` | reply to `list` |
-| `peer_joined` | `peer`, `name` | a peer joined |
+| `room_info` | `code`, `name`, `players`, `max_players`, `locked`, `full` | reply to `peek` |
+| `peer_joined` | `peer`, `name`, `nearby` | a peer joined |
 | `peer_away` / `peer_back` | `peer` | a peer's socket dropped / resumed |
 | `peer_left` | `peer`, `reason` | a peer was removed |
 | `host_away` | `grace_secs` | host socket dropped |
@@ -188,11 +201,13 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `kicked` |  | you were kicked |
 | `error` | `code`, `message` | a request failed |
 
-The `room` object in `joined` holds `code`, `name`, `public`, `max_players`, `locked`, `meta`, `host` (peer ID), `you` (your peer ID), `is_host`, `peers: [{id, name, away}]`, `resume`, and `key` (host only).
+The `room` object in `joined` holds `code`, `name`, `public`, `max_players`, `locked`, `meta`, `host` (peer ID), `you` (your peer ID), `is_host`, `peers: [{id, name, away, nearby}]`, `resume`, and `key` (host only).
 
 Error codes: `bad_message`, `bad_token`, `origin`, `rate_limited`, `already_in_room`, `not_in_room`, `not_host`, `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `too_many_rooms`, `public_disabled`, `peer_unavailable`, `meta_too_large`.
 
-`replaced` is sent to an old socket when the same session resumes on a new one. HTTP endpoints return `{error}` with `rate_limited`, `not_found`, `origin`, `bad_token`, `turn_disabled` or `turn_unconfigured`.
+`nearby` on a peer is true when that peer's public IP matches the host's (same rule as Public listing); the host's own entry is always `true`. Games use it to force relayed connections between players who are not nearby, so neither learns the other's IP.
+
+`replaced` is sent to an old socket as `{t: "error", code: "replaced"}` when the same session resumes on a new one; the old socket stays open but is no longer in the room. When the host sends `leave`, it also receives `room_closed`. A peer that resumes while its old socket is still open causes `peer_back` without an earlier `peer_away`. HTTP endpoints return `{error}` with `rate_limited`, `not_found`, `origin`, `bad_token`, `turn_disabled` or `turn_unconfigured`.
 
 ## TURN and connectivity
 
@@ -207,7 +222,7 @@ TURN is essential, not a fallback: players on cellular carrier-grade NAT or stri
 
 ## Game networking guidance
 
-Games built on Peer Helper should be host-authoritative with snapshot interpolation. These are recommendations for the games, not server features.
+Games built on Handshake should be host-authoritative with snapshot interpolation. These are recommendations for the games, not server features.
 
 ### Model
 
@@ -231,12 +246,12 @@ Games built on Peer Helper should be host-authoritative with snapshot interpolat
 
 ## JS client library
 
-One plain-JavaScript ES module, `peer-helper.js`, shared by every game, no build step and no dependencies beyond the browser. Types are documented with JSDoc so editors still autocomplete. Games import it directly from GitHub Pages or vendor a copy.
+One plain-JavaScript ES module, `handshake.js`, shared by every game, no build step and no dependencies beyond the browser. Types are documented with JSDoc so editors still autocomplete. Games import it directly from GitHub Pages or vendor a copy.
 
 ```js
-import { PeerHelper } from "./peer-helper.js";
+import { Handshake } from "./handshake.js";
 
-const ph = new PeerHelper({
+const ph = new Handshake({
   server: "https://signal.example.com",
   app: "pig-pens",
   version: 3,
@@ -256,6 +271,9 @@ room.on("peerLeft", (peer) => {});
 room.on("hostAway", () => {});
 room.on("closed", (reason) => {});
 
+// Look before joining
+const info = await ph.peek(code);            // {code, name, players, maxPlayers, locked, full}
+
 // Joining
 const joined = await ph.joinRoom(code, key);   // or ph.joinFromUrl()
 const rooms = await ph.listRooms();            // public, nearby first
@@ -268,6 +286,7 @@ The library owns everything every game would otherwise repeat:
 - `RTCPeerConnection` setup, both data channels, offer/answer and ICE exchange
 - ICE restart on network change, `visibilitychange` handling, Wake Lock request
 - connection-type detection through `getStats()`
+- relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`
 
 Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass through untouched on either channel.
 
@@ -287,6 +306,8 @@ Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass thr
 | Host-alone timeout | 30 min | `limits.idle_room_secs` |
 | Session mints per IP | 30 / min | `limits.sessions_per_min` |
 | Join attempts per IP | 20 / min | `limits.joins_per_min` |
+| Failed joins and peeks per app (all IPs) | 200 / min | `limits.app_failed_joins_per_min` |
+| Expiry sweep (grace, idle, age) | every 5 s | fixed |
 | Room meta size | 1 KB | fixed |
 
 ### Operations
@@ -305,4 +326,18 @@ Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass thr
 
 - Should kicked peers be barred from rejoining? Currently only locking the room prevents it.
 - Does the lobby need room-name filtering beyond the 32-character cap?
-- Distribution of `peer-helper.js`: one copy on GitHub Pages imported by URL, or vendored per game?
+- ~~Distribution of `handshake.js`~~: resolved, each game vendors a copy (the source lives in this repo at `client/handshake.js`).
+
+## Phase 2: Knock to join
+
+For apps with `list = "knock"`, `list` returns nearby rooms only, without their codes: each entry has an opaque `ref` instead of `code`. A caller joins such a room by knocking; the host decides.
+
+| t | Fields | Direction |
+| --- | --- | --- |
+| `knock` | `ref` | client to server, not in a room; counts as a join attempt |
+| `knock` | `knock` (id) | server to host |
+| `admit` / `deny` | `knock` | host to server |
+| `knock_wait` | `knock` | server to the knocker |
+| `joined` / `denied` | as `join` / none | server to the knocker |
+
+A knock expires after 60 s. Joining with the code never needs a knock. The game shows the knock to the host behind a 2-second hold, so a child cannot admit by accident.
