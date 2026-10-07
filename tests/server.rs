@@ -1028,3 +1028,38 @@ async fn players_carry_nearby_flag() {
     let flags: Vec<&Value> = far_view["peers"].as_array().unwrap().iter().map(|p| &p["nearby"]).collect();
     assert_eq!(flags, [&json!(true), &json!(true), &json!(false)]);
 }
+
+#[tokio::test]
+async fn failed_joins_limited_per_app_across_ips() {
+    let s = start_limits("app_failed_joins_per_min = 3").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": false })).await;
+
+    for i in 0..2 {
+        let mut c = s.client_at("game", 1, Some(&format!("198.51.100.{i}"))).await;
+        c.send(json!({ "t": "join", "code": "ZZZZZ" })).await;
+        c.expect_error("not_found").await;
+    }
+    let mut c = s.client_at("game", 1, Some("198.51.100.9")).await;
+    c.send(json!({ "t": "join", "code": room["code"], "key": "wrong" })).await;
+    c.expect_error("bad_key").await;
+
+    // Three failures from three IPs: every join for the app is now refused, even a good one.
+    let mut good = s.client_at("game", 1, Some("203.0.113.77")).await;
+    good.send(json!({ "t": "join", "code": room["code"], "key": room["key"] })).await;
+    good.expect_error("rate_limited").await;
+
+    // Other apps are unaffected.
+    let mut other = s.client("tiny", 1).await;
+    other.send(json!({ "t": "join", "code": "ZZZZZ" })).await;
+    other.expect_error("not_found").await;
+}
+
+#[tokio::test]
+async fn successful_joins_do_not_count_toward_app_limit() {
+    let s = start_limits("app_failed_joins_per_min = 1").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+    s.client("game", 1).await.join(&room).await;
+    s.client("game", 1).await.join(&room).await;
+}

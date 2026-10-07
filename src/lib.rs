@@ -90,6 +90,8 @@ pub struct Limits {
     pub idle_room_secs: u64,
     pub sessions_per_min: u32,
     pub joins_per_min: u32,
+    /// Failed joins and peeks (`not_found`, `bad_key`) per app per minute, across all IPs.
+    pub app_failed_joins_per_min: u32,
 }
 
 impl Default for Limits {
@@ -101,6 +103,7 @@ impl Default for Limits {
             idle_room_secs: 1800,
             sessions_per_min: 30,
             joins_per_min: 20,
+            app_failed_joins_per_min: 200,
         }
     }
 }
@@ -177,12 +180,16 @@ struct Metrics {
     sockets: AtomicU64,
 }
 
+type RateMap = HashMap<(IpAddr, &'static str), (Instant, u32)>;
+type FailMap = HashMap<String, (Instant, u32)>; // app id -> (window start, failures)
+
 #[derive(Default)]
 struct Inner {
     conns: Conns,
     rooms: HashMap<String, HashMap<String, Room>>, // app id -> code -> room
     resume: HashMap<String, (String, String, PeerId)>, // token -> (app, code, peer)
-    rate: HashMap<(IpAddr, &'static str), (Instant, u32)>,
+    rate: RateMap,
+    app_fails: FailMap,
 }
 
 /// Live, authenticated sockets. Sends never block: a socket whose queue is
@@ -562,7 +569,7 @@ impl App {
         let grace = self.grace();
         let max_age = Duration::from_secs(self.cfg.limits.room_max_age_secs);
         let idle = Duration::from_secs(self.cfg.limits.idle_room_secs);
-        let Inner { conns, rooms, resume, rate } = inner;
+        let Inner { conns, rooms, resume, rate, app_fails } = inner;
 
         for app_rooms in rooms.values_mut() {
             let mut to_close: Vec<(String, &str)> = Vec::new();
@@ -598,13 +605,36 @@ impl App {
         }
         rooms.retain(|_, r| !r.is_empty());
         rate.retain(|_, (t, _)| now - *t < Duration::from_secs(60));
+        app_fails.retain(|_, (t, _)| now - *t < Duration::from_secs(60));
         self.reap_dead(inner);
     }
 
     // ---- message handling ----------------------------------------------
 
+    /// Checks shared by `join` and `peek`, in order: not already in a room,
+    /// the per-IP attempt budget, then the app's failed-attempt budget.
+    fn join_gate(
+        &self,
+        bound: &Option<(String, PeerId)>,
+        rate: &mut RateMap,
+        app_fails: &mut FailMap,
+        ip: IpAddr,
+        app_id: &str,
+    ) -> Result<(), (&'static str, &'static str)> {
+        if bound.is_some() {
+            return Err(("already_in_room", "leave your current room first"));
+        }
+        if !rate_allow(rate, ip, "join", self.cfg.limits.joins_per_min) {
+            return Err(("rate_limited", "too many join attempts; wait a minute"));
+        }
+        if app_fails_over(app_fails, app_id, self.cfg.limits.app_failed_joins_per_min) {
+            return Err(("rate_limited", "too many failed join attempts for this game; wait a minute"));
+        }
+        Ok(())
+    }
+
     fn handle(&self, inner: &mut Inner, conn: ConnId, msg: In) {
-        let Inner { conns, rooms, resume, rate } = inner;
+        let Inner { conns, rooms, resume, rate, app_fails } = inner;
         let Some(c) = conns.map.get(&conn) else {
             return;
         };
@@ -675,20 +705,19 @@ impl App {
                     self.metrics.joins_rejected.fetch_add(1, Ordering::Relaxed);
                     conns.error(conn, code, message);
                 };
-                if bound.is_some() {
-                    return reject(conns, "already_in_room", "leave your current room first");
-                }
-                if !rate_allow(rate, ip, "join", self.cfg.limits.joins_per_min) {
-                    return reject(conns, "rate_limited", "too many join attempts; wait a minute");
+                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &app_id) {
+                    return reject(conns, code, message);
                 }
                 let code = code.trim().to_ascii_uppercase();
                 let Some(room) = app_rooms.get_mut(&code) else {
+                    app_fail(app_fails, &app_id);
                     return reject(conns, "not_found", "no room with that code");
                 };
                 if room.version != version {
                     return reject(conns, "version_mismatch", "that room runs a different game version");
                 }
                 if !room.public && !key.as_deref().is_some_and(|k| ct_eq(k, &room.key)) {
+                    app_fail(app_fails, &app_id);
                     return reject(conns, "bad_key", "invalid room key");
                 }
                 if room.locked {
@@ -1075,7 +1104,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 fn rate_allow(
-    rate: &mut HashMap<(IpAddr, &'static str), (Instant, u32)>,
+    rate: &mut RateMap,
     ip: IpAddr,
     bucket: &'static str,
     per_min: u32,
@@ -1087,6 +1116,21 @@ fn rate_allow(
     }
     entry.1 += 1;
     entry.1 <= per_min
+}
+
+/// True while `app` has used up its failed-join budget for the current minute.
+fn app_fails_over(fails: &mut FailMap, app: &str, per_min: u32) -> bool {
+    let now = Instant::now();
+    let entry = fails.entry(app.to_string()).or_insert((now, 0));
+    if now - entry.0 >= Duration::from_secs(60) {
+        *entry = (now, 0);
+    }
+    entry.1 >= per_min
+}
+
+/// Count one failed join or peek against `app`.
+fn app_fail(fails: &mut FailMap, app: &str) {
+    fails.entry(app.to_string()).or_insert((Instant::now(), 0)).1 += 1;
 }
 
 /// IPv4 exact; IPv6 by /64, since every device on a v6 LAN has its own address.
