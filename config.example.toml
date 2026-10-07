@@ -1,4 +1,4 @@
-# peer-helper configuration. Secrets come from env vars, never this file:
+# handshake configuration. Secrets come from env vars, never this file:
 #   SESSION_SECRET (required, 32+ chars), SESSION_SECRET_PREV (optional, for rotation)
 #   TURN_SECRET (must match coturn's static-auth-secret)
 
@@ -32,6 +32,13 @@ turn = true
 
 [apps.skerry-island]
 origins = ["https://seth.github.io"]
+max_players = 4
+max_rooms = 20
+public_rooms = false
+turn = true
+
+[apps.tractor-pickup]
+origins = ["https://four43.com"]
 max_players = 4
 max_rooms = 20
 public_rooms = false
