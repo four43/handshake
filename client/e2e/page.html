@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>handshake e2e</title>
+<script type="module">
+  import { Handshake } from '../handshake.js';
+  // Keep every socket so the test can drop one, as a network would.
+  window.sockets = [];
+  class TrackedWebSocket extends WebSocket { constructor(...a) { super(...a); window.sockets.push(this); } }
+  window.got = [];
+  window.listen = peer => peer.on('message', (d, { reliable }) =>
+    window.got.push({ reliable, data: d instanceof ArrayBuffer ? [...new Uint8Array(d)] : d }));
+  window.make = () => new Handshake({ server: 'http://127.0.0.1:18080', app: 'e2e', version: 1, WebSocket: TrackedWebSocket, wakeLock: false });
+  window.ready = true;
+</script>

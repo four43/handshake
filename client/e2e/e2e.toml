@@ -1,0 +1,12 @@
+# Server config for the e2e test (client/e2e/run.sh). Pages are served from http://localhost:8099.
+listen = "0.0.0.0:8080"
+allow_localhost = true
+
+[limits]
+grace_secs = 30
+
+[apps.e2e]
+origins = []
+max_players = 4
+public_rooms = true
+turn = false
