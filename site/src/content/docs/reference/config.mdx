@@ -1,0 +1,26 @@
+---
+title: Server configuration
+description: Every key in config.toml, with types and defaults.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import ConfigReference from '../../../components/ConfigReference.astro';
+import example from '../../../../../config.example.toml?raw';
+
+The server reads `config.toml` from the path in the `CONFIG` environment variable (the image uses `/etc/handshake/config.toml`). Secrets never go in this file:
+
+| Variable | |
+| --- | --- |
+| `SESSION_SECRET` | Required, 32+ characters. Signs session tokens. |
+| `SESSION_SECRET_PREV` | Optional. Also accepted when verifying, so you can rotate the secret without logging everyone out. |
+| `TURN_SECRET` | Must match coturn's `static-auth-secret`. Needed when `[turn]` is set. |
+
+## Keys
+
+Generated from the `Config` type in `src/lib.rs`.
+
+<ConfigReference />
+
+## Example
+
+<Code code={example} lang="toml" title="config.example.toml" />

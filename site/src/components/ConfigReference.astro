@@ -1,0 +1,33 @@
+---
+// Every config.toml key, from `Config` in src/lib.rs via site/schemas/config.json.
+import schema from '../../schemas/config.json';
+import FieldTable from './FieldTable.astro';
+import { fields, inline, resolve, type Schema } from '../lib/schema';
+
+const root = schema as Schema;
+const top = fields(root, root);
+const table = (key: string) => resolve(root, root.properties![key]);
+const apps = root.properties!.apps.additionalProperties as Schema;
+const sections = [
+  { heading: 'Top level', id: 'top-level', description: '', rows: top.filter(f => !['limits', 'turn', 'apps'].includes(f.name)) },
+  { heading: '[limits]', id: 'limits', description: table('limits').description ?? '', rows: fields(root, table('limits')) },
+  { heading: '[turn]', id: 'turn', description: table('turn').description ?? '', rows: fields(root, table('turn')) },
+  { heading: '[apps.<id>]', id: 'apps', description: table('apps').description ?? '', rows: fields(root, resolve(root, apps)) },
+];
+---
+
+{
+  sections.map(s => (
+    <section class="config-section" id={s.id}>
+      <h3><a href={`#${s.id}`}>{s.id === 'top-level' ? s.heading : <code>{s.heading}</code>}</a></h3>
+      {s.description && <p set:html={inline(s.description)} />}
+      <FieldTable fields={s.rows} showDefault />
+    </section>
+  ))
+}
+
+<style>
+  .config-section h3 a { text-decoration: none; }
+  .config-section h3 a { color: var(--sl-color-white); }
+  .config-section h3 code { color: var(--sl-color-text-accent); background: none; border: none; padding: 0; font-size: var(--sl-text-lg); }
+</style>

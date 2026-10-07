@@ -1,0 +1,140 @@
+---
+// Replaces Starlight's Hero: same frontmatter (title, tagline, actions), with the network animation as its image.
+import { LinkButton } from '@astrojs/starlight/components';
+import Flow, { type FlowEdge, type FlowNode } from './Flow.astro';
+
+const { data } = Astro.locals.starlightRoute.entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+// Frontmatter links are root-relative without the deploy base, like content links.
+const withBase = (href: string) => (href.startsWith('/') ? import.meta.env.BASE_URL.replace(/\/$/, '') + href : href);
+
+// A host in the middle of its guests (game data, lime) and the signaling server up top (violet, dashed),
+// which only introduces them.
+const host = { x: 190, y: 245 };
+const angles = [200, 245, 295, 340, 30, 85, 140];
+const peers: FlowNode[] = angles.map((deg, i) => {
+  const a = (deg * Math.PI) / 180, r = i % 2 ? 150 : 128;
+  return { id: `p${i}`, x: Math.round(host.x + Math.cos(a) * r), y: Math.round(host.y + Math.sin(a) * r), kind: 'peer' };
+});
+const nodes: FlowNode[] = [
+  { id: 'signal', x: 360, y: 40, kind: 'server', label: 'signal' },
+  { id: 'host', ...host, kind: 'host', label: 'host' },
+  ...peers,
+];
+const edges: FlowEdge[] = [
+  { from: 'signal', to: 'host', kind: 'signal', out: 1, back: 1, bend: 30 },
+  { from: 'signal', to: 'p2', kind: 'signal', out: 1, bend: -24, dur: 4.2 },
+  { from: 'signal', to: 'p3', kind: 'signal', out: 1, bend: 18, dur: 3.2 },
+  ...peers.map((p, i): FlowEdge => ({ from: 'host', to: p.id, out: 2, back: 1, dur: 1.5 + (i % 3) * 0.35 })),
+];
+---
+
+<div class="hs-hero not-content">
+  <div class="hs-hero-copy">
+    <p class="hs-eyebrow"><span class="hs-pip" aria-hidden="true"></span> WebRTC signaling · room registry</p>
+    <h1 id="_top" data-page-title set:html={title} />
+    {tagline && <p class="hs-tagline" set:html={tagline} />}
+    {
+      actions.length > 0 && (
+        <div class="hs-actions">
+          {actions.map(({ attrs: { class: className, ...attrs } = {}, icon, link: href, text, variant }) => (
+            <LinkButton href={withBase(href)} {variant} icon={icon?.name} class:list={[className]} {...attrs}>
+              {text}
+            </LinkButton>
+          ))}
+        </div>
+      )
+    }
+  </div>
+  <div class="hs-hero-art">
+    <Flow
+      width={400}
+      height={415}
+      nodes={nodes}
+      edges={edges}
+      label="A host connected peer to peer to seven players; a signaling server introduces them"
+    />
+  </div>
+</div>
+
+<style>
+  .hs-hero {
+    position: relative;
+    display: grid;
+    gap: 2rem;
+    align-items: center;
+    padding-block: 2rem 1rem;
+  }
+  .hs-hero::before {
+    content: '';
+    position: absolute;
+    inset: -6rem -20vw auto;
+    height: 38rem;
+    background:
+      radial-gradient(40rem 22rem at 70% 40%, var(--hs-hero-glow), transparent 70%),
+      radial-gradient(circle at 1px 1px, var(--hs-grid-dot) 1px, transparent 0) 0 0 / 22px 22px;
+    mask-image: linear-gradient(to bottom, black 55%, transparent);
+    z-index: -1;
+    pointer-events: none;
+  }
+  .hs-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0 0 1.25rem;
+    padding: 0.3rem 0.85rem;
+    border: 1px solid var(--hs-lime-line);
+    border-radius: 999px;
+    font-family: var(--sl-font-mono);
+    font-size: var(--sl-text-xs);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--sl-color-text-accent);
+    background: var(--hs-lime-wash);
+  }
+  .hs-pip {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--hs-lime);
+    box-shadow: 0 0 0.6rem var(--hs-lime);
+  }
+  h1 {
+    margin: 0;
+    font-family: var(--hs-font-display);
+    font-size: clamp(2.4rem, 1.2rem + 4.6vw, 4.4rem);
+    font-weight: 700;
+    line-height: 1.02;
+    letter-spacing: -0.035em;
+    color: var(--sl-color-white);
+    text-wrap: balance;
+  }
+  h1 :global(em) {
+    font-style: normal;
+    color: var(--hs-lime-text);
+    text-shadow: 0 0 2.5rem var(--hs-lime-shadow);
+  }
+  .hs-tagline {
+    margin: 1.25rem 0 0;
+    max-width: 36rem;
+    font-size: clamp(var(--sl-text-base), 0.9rem + 0.6vw, var(--sl-text-xl));
+    line-height: 1.55;
+    color: var(--sl-color-gray-2);
+  }
+  .hs-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem 1.25rem;
+    margin-top: 2rem;
+  }
+  .hs-hero-art {
+    width: min(100%, 34rem);
+    margin-inline: auto;
+  }
+  @media (min-width: 50rem) {
+    .hs-hero {
+      grid-template-columns: 1.1fr 1fr;
+      padding-block: 4rem 3rem;
+    }
+  }
+</style>

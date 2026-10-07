@@ -1,0 +1,29 @@
+---
+// Client-to-server messages, from the `In` enum in src/lib.rs via site/schemas/client-messages.json.
+import schema from '../../schemas/client-messages.json';
+import FieldTable from './FieldTable.astro';
+import { inline, variants, type Schema } from '../lib/schema';
+
+const messages = variants(schema as Schema);
+---
+
+<div class="messages">
+  {
+    messages.map(m => (
+      <section class="message" id={`in-${m.name}`}>
+        <h3><a href={`#in-${m.name}`}><code>{m.name}</code></a></h3>
+        <p set:html={inline(m.description)} />
+        <FieldTable fields={m.fields} />
+      </section>
+    ))
+  }
+</div>
+
+<style>
+  .message {
+    margin-top: 1.5rem; padding: 0.25rem 1.25rem 1rem; border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem; background: var(--hs-surface);
+  }
+  .message h3 a { text-decoration: none; }
+  .message h3 code { font-size: var(--sl-text-lg); color: var(--sl-color-text-accent); background: none; border: none; padding: 0; }
+</style>

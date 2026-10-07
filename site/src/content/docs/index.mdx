@@ -1,0 +1,178 @@
+---
+title: Handshake
+description: A tiny self-hosted WebRTC signaling server and room registry for browser games.
+template: splash
+editUrl: false
+hero:
+  title: Get players <em>connected</em>. Then get out of the way.
+  tagline: Handshake is a tiny self-hosted signaling server and room registry for WebRTC browser games. It handles rooms, join codes, TURN credentials and reconnects, then your game talks peer to peer.
+  actions:
+    - text: Quick start
+      link: /quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: JS client API
+      link: /reference/client/
+      variant: secondary
+    - text: GitHub
+      link: https://github.com/four43/handshake
+      icon: external
+      variant: minimal
+---
+
+import { Tabs, TabItem, Steps, LinkButton } from '@astrojs/starlight/components';
+import Feature from '../../components/Feature.astro';
+import Flow from '../../components/Flow.astro';
+import * as art from '../../components/features';
+
+<div class="hs-section not-content">
+  <p class="hs-kicker">What it does</p>
+  <h2 class="hs-h2">Everything before the first packet.</h2>
+  <p class="hs-lede">Matchmaking, NAT traversal and flaky mobile sockets are the same chore in every multiplayer game. Handshake does them once, so your game starts at <code>peer.send()</code>.</p>
+  <div class="hs-grid">
+    <Feature title="Rooms in one code" art="A host with three guests, a fourth on the way" {...art.rooms}>
+      Five-character join codes with no look-alike letters. Rooms can be private (code + key, QR-friendly) or public, and the lobby lists nearby rooms first.
+    </Feature>
+    <Feature title="Peer to peer" art="Two players exchanging data directly" {...art.p2p}>
+      The server only relays connection setup. Game data flows host ↔ guest over WebRTC data channels and never touches it.
+    </Feature>
+    <Feature title="TURN when it must" art="Two players connected through a relay" {...art.turn}>
+      Short-lived coturn credentials for players on cellular or strict Wi-Fi, and relay-only links to strangers so nobody learns anyone's IP.
+    </Feature>
+    <Feature title="Survives iPhones" art="A dropped player reconnecting to the host" {...art.resume}>
+      Sockets drop all the time on phones. Members keep their seat for a grace period and resume automatically, with ICE restarts and a wake lock.
+    </Feature>
+    <Feature title="Two channels" art="A fast unreliable channel and a reliable one between two players" {...art.channels}>
+      <code>state</code> is unordered with no resends, for snapshots. <code>events</code> is reliable and ordered, for joins, scores and chat.
+    </Feature>
+    <Feature title="Tiny and self-hosted" art="A signaling server introducing four players" {...art.tiny}>
+      One Rust binary in a ~20 MB distroless image, plus a single dependency-free <code>handshake.js</code> that each game vendors.
+    </Feature>
+  </div>
+</div>
+
+<div class="hs-section hs-split not-content">
+  <div>
+    <p class="hs-kicker">The client</p>
+    <h2 class="hs-h2">A room in a dozen lines.</h2>
+    <p class="hs-lede">One ES module, no build step. It fetches session tokens and TURN credentials, opens the socket, sets up WebRTC and resumes after drops.</p>
+    <a class="hs-link" href="quickstart/">Walk through the quick start →</a>
+  </div>
+  <div class="hs-code">
+<Tabs>
+<TabItem label="Host">
+```js
+import { Handshake } from './handshake.js';
+
+const hs = new Handshake({
+  server: 'https://signal.example.com',
+  app: 'pig-pens',
+  version: 3,
+  name: 'Seth',
+});
+
+const room = await hs.createRoom({ maxPlayers: 6 });
+showQrCode(room.shareUrl); // ?r=<code>&k=<key>
+
+room.on('peer', peer => {
+  peer.send(snapshot);                  // unreliable, binary
+  peer.send({ go: true }, { reliable: true });
+  peer.on('message', data => applyInput(peer.id, data));
+});
+```
+</TabItem>
+<TabItem label="Guest">
+```js
+import { Handshake, HandshakeError } from './handshake.js';
+
+const hs = new Handshake({ server, app: 'pig-pens', version: 3, name: 'Ada' });
+
+try {
+  const room = (await hs.joinFromUrl()) ?? (await hs.joinRoom(askForCode()));
+  room.on('peer', host => {
+    host.on('message', data => render(data));
+    host.connectionType; // 'direct' | 'relayed'
+  });
+  room.on('closed', reason => backToLobby(reason));
+} catch (e) {
+  if (e instanceof HandshakeError && e.code === 'full') showFull();
+}
+```
+</TabItem>
+</Tabs>
+  </div>
+</div>
+
+<div class="hs-section hs-split hs-split-flip not-content">
+  <div class="hs-how-art">
+    <Flow
+      width={360}
+      height={220}
+      label="The server introduces the host and a guest, then they connect directly"
+      nodes={[
+        { id: 's', x: 180, y: 30, kind: 'server', label: 'signal' },
+        { id: 'h', x: 60, y: 160, kind: 'host', label: 'host' },
+        { id: 'g', x: 300, y: 160, label: 'guest' },
+      ]}
+      edges={[
+        { from: 's', to: 'h', kind: 'signal', out: 1, back: 1, dur: 2.8 },
+        { from: 's', to: 'g', kind: 'signal', out: 1, back: 1, dur: 2.8 },
+        { from: 'h', to: 'g', out: 4, back: 3, dur: 1.9 },
+      ]}
+    />
+  </div>
+  <div>
+    <p class="hs-kicker">How it works</p>
+    <h2 class="hs-h2">Introduce, then step aside.</h2>
+    <div class="hs-steps">
+<Steps>
+1. Your game page gets a short-lived **session token** from `POST /session`. The server checks the page's origin against your app's allowlist.
+2. The host **creates a room** over the WebSocket and gets a join code. Guests join with the code (and key, for private rooms).
+3. The server **relays SDP and ICE** between the host and each guest until their data channels open, through TURN if needed.
+4. From then on, **game traffic is peer to peer**. The socket stays open only for reconnects and room events.
+</Steps>
+    </div>
+  </div>
+</div>
+
+<div class="hs-cta not-content">
+  <h2 class="hs-h2">Ship multiplayer this weekend.</h2>
+  <p class="hs-lede">Run the server with Docker, drop <code>handshake.js</code> into your game, and open a room.</p>
+  <div class="hs-cta-actions">
+    <LinkButton href="quickstart/" icon="right-arrow">Quick start</LinkButton>
+    <LinkButton href="guides/self-hosting/" variant="secondary">Self-hosting guide</LinkButton>
+  </div>
+</div>
+
+<style>{`
+  .hs-section { margin-top: clamp(4rem, 8vw, 7rem); }
+  .hs-kicker {
+    margin: 0 0 0.5rem; font-family: var(--sl-font-mono); font-size: var(--sl-text-xs);
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--sl-color-text-accent);
+  }
+  .hs-h2 {
+    margin: 0; font-family: var(--hs-font-display); font-weight: 700; letter-spacing: -0.03em;
+    font-size: clamp(1.8rem, 1.2rem + 2.2vw, 2.8rem); line-height: 1.1; color: var(--sl-color-white);
+  }
+  .hs-lede { margin: 1rem 0 0; max-width: 40rem; color: var(--sl-color-gray-2); font-size: var(--sl-text-lg); line-height: 1.6; }
+  .hs-lede code { font-family: var(--sl-font-mono); font-size: 0.85em; color: var(--sl-color-text-accent); }
+  .hs-grid { display: grid; gap: 1rem; margin-top: 2.5rem; grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr)); }
+  .hs-split { display: grid; gap: 2.5rem; align-items: center; }
+  .hs-code { min-width: 0; }
+  .hs-link { display: inline-block; margin-top: 1.5rem; color: var(--sl-color-text-accent); font-weight: 600; text-decoration: none; }
+  .hs-link:hover { text-decoration: underline; }
+  .hs-how-art { max-width: 26rem; width: 100%; margin-inline: auto; }
+  .hs-steps { margin-top: 1.5rem; color: var(--sl-color-gray-2); }
+  .hs-steps code { font-size: 0.85em; }
+  .hs-cta {
+    margin-top: clamp(4rem, 8vw, 7rem); padding: clamp(2rem, 5vw, 3.5rem); text-align: center;
+    border: 1px solid var(--hs-lime-line); border-radius: 1.5rem;
+    background: radial-gradient(30rem 14rem at 50% 0%, var(--hs-hero-glow), transparent 70%), var(--hs-surface);
+  }
+  .hs-cta .hs-lede { margin-inline: auto; }
+  .hs-cta-actions { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; margin-top: 2rem; }
+  @media (min-width: 60rem) {
+    .hs-split { grid-template-columns: 1fr 1.25fr; }
+    .hs-split-flip { grid-template-columns: 1fr 1.1fr; }
+  }
+`}</style>

@@ -89,7 +89,7 @@ turn = true
 
 1. **Origin allowlist.** `POST /session` and the WebSocket upgrade both require an `Origin` header matching the app's list. Browsers cannot forge `Origin`; scripts can.
 2. **Session token.** `/session` returns an HMAC-SHA256-signed token carrying app ID, protocol version and expiry (default 15 minutes). The WebSocket `hello` and `/turn` both require it.
-3. **Rate limits.** Per-IP limits on session minting and join attempts blunt scripted abuse and code brute-forcing. A per-app limit on failed joins and peeks (`not_found`, `bad_key`) across all IPs stops a guesser with many addresses; when it is hit, joins and peeks for that app return `rate_limited` until the minute rolls over.
+3. **Rate limits.** Per-IP limits on session minting and join attempts blunt scripted abuse and code brute-forcing. A per-app limit on failed joins and peeks (`not_found`, `bad_key`) across all IPs stops a guesser with many addresses; when it is hit, joins and peeks for that app return `rate_limited` until the minute rolls over. The client IP is the socket address, or the last untrusted `X-Forwarded-For` entry when the socket comes from `trusted_proxies` (loopback and private networks by default), so per-IP limits hold with or without a proxy in front and cannot be dodged by sending the header directly.
 4. **TURN quota.** TURN usernames encode expiry and app ID, so coturn logs attribute relay usage per app. Cloudflare Turnstile before `/session` is the upgrade path if abuse appears.
 
 ### Path-based apps share an origin
@@ -261,32 +261,38 @@ One plain-JavaScript ES module, `handshake.js`, shared by every game, no build s
 ```js
 import { Handshake } from "./handshake.js";
 
-const ph = new Handshake({
+const hs = new Handshake({
   server: "https://signal.example.com",
   app: "pig-pens",
   version: 3,
-  name: "Seth",
+  name: "Seth",                 // your display name
 });
 
-const room = await ph.createRoom({ public: false, maxPlayers: 6 });
-room.shareUrl;          // ?r=K7MX2&k=... for QR or navigator.share()
+const room = await hs.createRoom({ public: false, maxPlayers: 6, name: "Seth's farm" });
+room.shareUrl;          // this page + ?r=K7MX2&k=... for a QR code or navigator.share()
 
 room.on("peer", (peer) => {
-  peer.send(snapshotBuffer);                 // state channel, unreliable
+  peer.name;                                 // the player's display name
+  peer.send(snapshotBuffer);                 // state channel, unreliable, binary only
   peer.send({ type: "score" }, { reliable: true }); // events channel
   peer.on("message", (data, { reliable }) => {});
   peer.connectionType;  // "direct" | "relayed"
 });
-room.on("peerLeft", (peer) => {});
-room.on("hostAway", () => {});
+room.on("peerLeft", (id, reason) => {});
+room.on("hostAway", (graceSecs) => {});
 room.on("closed", (reason) => {});
 
+// Host controls resolve once applied; they reject with not_host, a server error, network, timeout or closed
+await room.lock(true);
+await room.setMeta({ map: "farm" });
+await room.kick(peerId);
+
 // Look before joining
-const info = await ph.peek(code, key);       // key only for a private room; {code, name, players, maxPlayers, locked, full}
+const info = await hs.peek(code, key);       // key only for a private room; {code, name, players, maxPlayers, locked, full}
 
 // Joining
-const joined = await ph.joinRoom(code, key);   // or ph.joinFromUrl()
-const rooms = await ph.listRooms();            // public, nearby first
+const joined = await hs.joinFromUrl() ?? await hs.joinRoom(code, key); // joinFromUrl: null without ?r=
+const rooms = await hs.listRooms();          // public, nearby first; [{code, name, players, maxPlayers, meta, nearby}]
 ```
 
 The library owns everything every game would otherwise repeat:
@@ -296,6 +302,7 @@ The library owns everything every game would otherwise repeat:
 - `RTCPeerConnection` setup, both data channels, offer/answer and ICE exchange
 - ICE restart on network change, `visibilitychange` handling, Wake Lock request
 - connection-type detection through `getStats()`
+- host controls (`lock`, `setMeta`, `kick`) that return promises settling on the server's answer
 - relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`
 
 Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass through untouched on either channel.

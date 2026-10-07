@@ -14,6 +14,18 @@ cd client && npm run e2e        # client + server: two Chromium pages, real WebR
                                 # first time: npm install && npx playwright install chromium)
 ```
 
+## Docs site
+
+`site/` is an [Astro Starlight](https://starlight.astro.build) site, published to GitHub Pages by
+`.github/workflows/docs.yml`. The JS client reference is generated from `client/handshake.js`'s JSDoc by
+TypeDoc. The WebSocket message and config references render `site/schemas/*.json`, which come from the
+Rust types (`schemars`, test builds only). `cargo test` fails when they are stale.
+
+```bash
+cd site && npm install && npm run dev           # http://localhost:4321/handshake/
+UPDATE_SCHEMAS=1 scripts/test.sh schemas_are_current   # after changing Config or the In enum
+```
+
 ## Run locally
 
 ```bash

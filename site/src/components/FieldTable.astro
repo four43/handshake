@@ -1,0 +1,43 @@
+---
+import { inline, type Field } from '../lib/schema';
+
+interface Props { fields: Field[]; showDefault?: boolean }
+const { fields, showDefault = false } = Astro.props;
+---
+
+{
+  fields.length === 0 ? (
+    <p class="no-fields">No fields.</p>
+  ) : (
+    <table class="field-table">
+      <thead>
+        <tr>
+          <th>Field</th>
+          <th>Type</th>
+          {showDefault && <th>Default</th>}
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {fields.map(f => (
+          <tr>
+            <td><code class="field-name">{f.name}</code>{!f.required && !showDefault && <span class="optional">optional</span>}</td>
+            <td><code class="field-type">{f.type}</code></td>
+            {showDefault && <td>{f.default ? <code>{f.default}</code> : f.required ? <span class="optional">required</span> : '—'}</td>}
+            <td set:html={inline(f.description)} />
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+<style>
+  .field-name { color: var(--sl-color-text-accent); font-weight: 600; white-space: nowrap; }
+  .field-type { white-space: nowrap; }
+  .optional {
+    margin-inline-start: 0.5rem; font-size: var(--sl-text-xs); color: var(--sl-color-gray-3);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .no-fields { color: var(--sl-color-gray-3); font-style: italic; }
+</style>

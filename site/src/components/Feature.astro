@@ -1,0 +1,36 @@
+---
+// A landing-page feature: a small Flow animation over a title and a line or two of copy.
+import Flow, { type FlowEdge, type FlowNode } from './Flow.astro';
+
+interface Props { title: string; nodes: FlowNode[]; edges: FlowEdge[]; art: string }
+const { title, nodes, edges, art } = Astro.props;
+---
+
+<article class="hs-feature">
+  <div class="hs-feature-art"><Flow width={220} height={96} nodes={nodes} edges={edges} label={art} /></div>
+  <h3>{title}</h3>
+  <div class="hs-feature-body"><slot /></div>
+</article>
+
+<style>
+  .hs-feature {
+    position: relative;
+    padding: 1.25rem 1.25rem 1.4rem;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 1rem;
+    background: linear-gradient(180deg, var(--hs-lime-wash), transparent 55%), var(--hs-surface);
+    transition: border-color 0.25s, transform 0.25s;
+  }
+  .hs-feature:hover { border-color: var(--hs-lime-line); transform: translateY(-2px); }
+  .hs-feature-art { margin: -0.25rem 0 0.9rem; padding: 0.5rem 0.75rem; }
+  h3 {
+    margin: 0 0 0.4rem;
+    font-family: var(--hs-font-display);
+    font-size: var(--sl-text-lg);
+    color: var(--sl-color-white);
+  }
+  .hs-feature-body { color: var(--sl-color-gray-2); font-size: var(--sl-text-sm); line-height: 1.6; }
+  .hs-feature-body :global(code) {
+    font-size: 0.9em; padding: 0.05em 0.3em; border-radius: 0.25rem; background: var(--hs-lime-wash);
+  }
+</style>

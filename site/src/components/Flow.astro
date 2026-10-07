@@ -1,0 +1,175 @@
+---
+// A little network: nodes joined by edges, with dots flowing along the edges.
+// `data` edges (lime) are game traffic between peers; `signal` edges (violet, dashed) go through the server.
+// Pure SVG + SMIL, no script. Dots are hidden for prefers-reduced-motion.
+
+export type FlowNode = {
+  id: string;
+  x: number;
+  y: number;
+  r?: number;
+  kind?: 'host' | 'peer' | 'server' | 'relay' | 'ghost';
+  label?: string;
+};
+export type FlowEdge = {
+  from: string;
+  to: string;
+  kind?: 'data' | 'signal';
+  /** Dots travelling from -> to. */
+  out?: number;
+  /** Dots travelling to -> from. */
+  back?: number;
+  /** Seconds for one dot to cross the edge. */
+  dur?: number;
+  /** Bend the edge sideways by this many units (quadratic curve). */
+  bend?: number;
+  /** Route through these points (for relays and loops). */
+  via?: [number, number][];
+};
+
+interface Props {
+  width: number;
+  height: number;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  label: string;
+  class?: string;
+}
+
+const { width, height, nodes, edges, label, class: className } = Astro.props;
+const byId = new Map(nodes.map(n => [n.id, n]));
+const uid = `flow-${Math.random().toString(36).slice(2, 8)}`;
+
+function pathFor(e: FlowEdge) {
+  const a = byId.get(e.from)!, b = byId.get(e.to)!;
+  if (e.via?.length) return `M${a.x},${a.y} ` + e.via.map(([x, y]) => `L${x},${y}`).join(' ') + ` L${b.x},${b.y}`;
+  if (!e.bend) return `M${a.x},${a.y} L${b.x},${b.y}`;
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+  const cx = mx - (dy / len) * e.bend, cy = my + (dx / len) * e.bend;
+  return `M${a.x},${a.y} Q${cx.toFixed(1)},${cy.toFixed(1)} ${b.x},${b.y}`;
+}
+
+// Deterministic jitter so dots on different edges don't march in lockstep.
+let seed = 7;
+const rand = () => ((seed = (seed * 9301 + 49297) % 233280) / 233280);
+
+const drawn = edges.map((e, i) => {
+  const d = pathFor(e);
+  const dur = e.dur ?? (e.kind === 'signal' ? 3.6 : 1.8);
+  const dots: { reverse: boolean; begin: string }[] = [];
+  const add = (n: number, reverse: boolean) => {
+    for (let k = 0; k < n; k++) dots.push({ reverse, begin: `-${((k / n) * dur + rand() * dur * 0.3).toFixed(2)}s` });
+  };
+  add(e.out ?? 1, false);
+  add(e.back ?? 0, true);
+  return { ...e, id: `${uid}-e${i}`, d, dur, dots, kind: e.kind ?? 'data' };
+});
+---
+
+<svg
+  class:list={['flow', className]}
+  viewBox={`0 0 ${width} ${height}`}
+  role="img"
+  aria-label={label}
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <radialGradient id={`${uid}-glow`}>
+      <stop offset="0%" stop-color="var(--hs-lime)" stop-opacity="0.55" />
+      <stop offset="100%" stop-color="var(--hs-lime)" stop-opacity="0" />
+    </radialGradient>
+    <filter id={`${uid}-blur`} x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="1.6" />
+    </filter>
+  </defs>
+
+  {drawn.map(e => <path id={e.id} d={e.d} class:list={['edge', `edge-${e.kind}`]} />)}
+
+  {
+    drawn.map(e =>
+      e.dots.map(dot => (
+        <g class:list={['dot', `dot-${e.kind}`]}>
+          <circle r={e.kind === 'signal' ? 2.6 : 3.2} class="dot-halo" filter={`url(#${uid}-blur)`} />
+          <circle r={e.kind === 'signal' ? 1.8 : 2.2} class="dot-core" />
+          <animateMotion
+            dur={`${e.dur}s`}
+            begin={dot.begin}
+            repeatCount="indefinite"
+            calcMode="linear"
+            keyPoints={dot.reverse ? '1;0' : '0;1'}
+            keyTimes="0;1"
+          >
+            <mpath href={`#${e.id}`} />
+          </animateMotion>
+          <animate
+            attributeName="opacity"
+            values="0;1;1;0"
+            keyTimes="0;0.12;0.88;1"
+            dur={`${e.dur}s`}
+            begin={dot.begin}
+            repeatCount="indefinite"
+          />
+        </g>
+      )),
+    )
+  }
+
+  {
+    nodes.map(n => {
+      const r = n.r ?? (n.kind === 'host' ? 16 : n.kind === 'server' ? 14 : 10);
+      return (
+        <g class:list={['node', `node-${n.kind ?? 'peer'}`]} transform={`translate(${n.x} ${n.y})`}>
+          {n.kind === 'host' && (
+            <>
+              <circle r={r * 2.6} fill={`url(#${uid}-glow)`} class="node-glow" />
+              <circle r={r} class="pulse">
+                <animate attributeName="r" values={`${r};${r * 2.1}`} dur="2.8s" repeatCount="indefinite" />
+                <animate attributeName="opacity" values="0.6;0" dur="2.8s" repeatCount="indefinite" />
+              </circle>
+            </>
+          )}
+          {n.kind === 'server' || n.kind === 'relay' ? (
+            <rect x={-r} y={-r} width={r * 2} height={r * 2} rx={r * 0.35} class="node-body" />
+          ) : (
+            <circle r={r} class="node-body" />
+          )}
+          {n.kind === 'server' && <path d={`M${-r * 0.45},${-r * 0.2} h${r * 0.9} M${-r * 0.45},${r * 0.2} h${r * 0.9}`} class="node-mark" />}
+          {n.kind === 'relay' && <path d={`M${-r * 0.5},0 h${r} M${r * 0.15},${-r * 0.35} l${r * 0.35},${r * 0.35} l${-r * 0.35},${r * 0.35}`} class="node-mark" />}
+          {n.kind !== 'server' && n.kind !== 'relay' && <circle r={r * 0.38} class="node-core" />}
+          {n.label && (
+            <text y={r + 14} class="node-label" text-anchor="middle">
+              {n.label}
+            </text>
+          )}
+        </g>
+      );
+    })
+  }
+</svg>
+
+<style>
+  .flow { display: block; width: 100%; height: auto; overflow: visible; }
+  .edge { fill: none; stroke-linecap: round; }
+  .edge-data { stroke: var(--hs-lime); stroke-opacity: 0.32; stroke-width: 1.5; }
+  .edge-signal { stroke: var(--hs-violet); stroke-opacity: 0.45; stroke-width: 1.2; stroke-dasharray: 3 5; }
+  .dot-data .dot-core { fill: var(--hs-lime-bright); }
+  .dot-data .dot-halo { fill: var(--hs-lime); opacity: 0.8; }
+  .dot-signal .dot-core { fill: var(--hs-violet-bright); }
+  .dot-signal .dot-halo { fill: var(--hs-violet); opacity: 0.8; }
+  .node-body { fill: var(--hs-node); stroke: var(--hs-lime); stroke-width: 1.5; }
+  .node-core { fill: var(--hs-lime); }
+  .node-host .node-body { stroke-width: 2.5; }
+  .node-server .node-body, .node-relay .node-body { stroke: var(--hs-violet); }
+  .node-mark { stroke: var(--hs-violet-bright); stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .node-ghost .node-body { stroke-dasharray: 2 3; stroke-opacity: 0.6; }
+  .node-ghost .node-core { opacity: 0.35; }
+  .pulse { fill: none; stroke: var(--hs-lime); stroke-width: 1.5; }
+  .node-label {
+    font-family: var(--sl-font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+    fill: var(--sl-color-gray-3);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot, .pulse { display: none; }
+  }
+</style>

@@ -1,0 +1,73 @@
+---
+title: WebSocket protocol
+description: Every message on the signaling socket, client to server and server to client.
+---
+
+import ClientMessages from '../../../components/ClientMessages.astro';
+
+The JS client speaks this protocol for you. Read this page if you are writing another client or debugging one.
+
+One WebSocket at `GET /ws` carries JSON text messages, each tagged by a `t` field. The signaling protocol version is `1`. It is separate from your game's own protocol `version`, which is pinned in the session token. Messages are at most 16 KB.
+
+## Connection flow
+
+1. `POST /session` with `{app, version}` returns a session token. See the [HTTP API](/reference/http/).
+2. Open `wss://<server>/ws` and send [`hello`](#in-hello) within 10 seconds. The token goes in this message, not the URL, so it stays out of proxy logs.
+3. The server replies `welcome`. You can now `create`, `join`, `resume`, `peek` or `list`.
+4. After `joined`, the host and each guest exchange `signal` messages until their data channels open.
+5. Keep the socket open for the whole session. A socket with no frames for 60 seconds is closed. The server pings every 20 seconds.
+
+## Client to server
+
+Generated from the `In` enum in `src/lib.rs`. Fields marked optional can be left out or set to `null`.
+
+<ClientMessages />
+
+## Server to client
+
+| `t` | Fields | Sent when |
+| --- | --- | --- |
+| `welcome` | `v` | after a valid `hello` |
+| `joined` | `room`, `resumed` | after `create`, `join` or `resume` |
+| `rooms` | `rooms: [{code, name, players, max_players, meta, nearby}]` | reply to `list` |
+| `room_info` | `code`, `name`, `players`, `max_players`, `locked`, `full` | reply to `peek` |
+| `peer_joined` | `peer`, `name`, `nearby` | a peer joined |
+| `peer_away` | `peer` | a peer's socket dropped; its seat is held for the grace period |
+| `peer_back` | `peer` | that peer resumed |
+| `peer_left` | `peer`, `reason` | a peer was removed: `left`, `timeout` or `kicked` |
+| `host_away` | `grace_secs` | the host's socket dropped |
+| `host_back` | | the host resumed |
+| `signal` | `from`, `data` | relayed SDP or ICE |
+| `room_meta` | `meta`, `locked` | the host changed meta or lock |
+| `room_closed` | `reason` | the room ended: `host_left`, `host_gone`, `expired` or `idle` |
+| `kicked` | | you were kicked |
+| `error` | `code`, `message` | a request failed |
+
+### The `room` object
+
+`joined.room` holds:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `code` | string | The 5-character join code. |
+| `name` | string | Room name. |
+| `public` | boolean | Joinable with the code alone. |
+| `max_players` | integer | Room size, host included. |
+| `locked` | boolean | New joins are refused. |
+| `meta` | JSON | The host's metadata blob. |
+| `host` | string | The host's peer id. |
+| `you` | string | Your peer id. |
+| `is_host` | boolean | Whether you are the host. |
+| `peers` | `{id, name, away, nearby}[]` | Every member, host included, in join order. |
+| `resume` | string | Your token for [`resume`](#in-resume). |
+| `key` | string \| null | The private key. Sent to the host only. |
+
+`nearby` is true when a member's public IP matches the host's (IPv4 exact, IPv6 by /64). The host's own entry is always `true`. Games use it to force relayed connections between players who are not nearby.
+
+## Errors
+
+`error.code` is one of:
+
+`bad_message`, `bad_token`, `origin`, `rate_limited`, `already_in_room`, `not_in_room`, `not_host`, `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `too_many_rooms`, `public_disabled`, `peer_unavailable`, `meta_too_large`.
+
+When the same session resumes on a new socket, the old one gets `{"t": "error", "code": "replaced"}`. It stays open but is no longer in the room.

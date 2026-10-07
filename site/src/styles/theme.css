@@ -1,0 +1,106 @@
+/* Handshake theme: green-tinted ink, electric lime accent, a touch of violet for signaling. */
+
+:root {
+  --hs-font-display: 'Space Grotesk Variable', 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --sl-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Dark (default) */
+  --sl-color-accent-low: #1c2a07;
+  --sl-color-accent: #a3e635;
+  --sl-color-accent-high: #d9f99d;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #e8eee6;
+  --sl-color-gray-2: #c2cbbf;
+  --sl-color-gray-3: #8b968a;
+  --sl-color-gray-4: #545e53;
+  --sl-color-gray-5: #2b332b;
+  --sl-color-gray-6: #181e18;
+  --sl-color-black: #0a0d0a;
+  --sl-color-gray-7: #121612;
+
+  --hs-lime: #a3e635;
+  --hs-lime-bright: #ecfccb;
+  --hs-lime-text: #bef264;
+  --hs-lime-shadow: rgb(163 230 53 / 0.45);
+  --hs-lime-line: rgb(163 230 53 / 0.35);
+  --hs-lime-wash: rgb(163 230 53 / 0.08);
+  --hs-violet: #8b5cf6;
+  --hs-violet-bright: #ddd6fe;
+  --hs-node: #101510;
+  --hs-surface: #0f130f;
+  --hs-hero-glow: rgb(163 230 53 / 0.14);
+  --hs-grid-dot: rgb(232 238 230 / 0.07);
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #ecfccb;
+  --sl-color-accent: #4d7c0f;
+  --sl-color-accent-high: #1a2e05;
+  --sl-color-white: #0b0f0a;
+  --sl-color-gray-1: #1b221a;
+  --sl-color-gray-2: #343d33;
+  --sl-color-gray-3: #5b6659;
+  --sl-color-gray-4: #8c968a;
+  --sl-color-gray-5: #c7cfc4;
+  --sl-color-gray-6: #e9eee6;
+  --sl-color-gray-7: #f5f8f2;
+  --sl-color-black: #ffffff;
+
+  --hs-lime: #65a30d;
+  --hs-lime-bright: #84cc16;
+  --hs-lime-text: #4d7c0f;
+  --hs-lime-shadow: rgb(132 204 22 / 0.25);
+  --hs-lime-line: rgb(77 124 15 / 0.3);
+  --hs-lime-wash: rgb(132 204 22 / 0.1);
+  --hs-violet: #7c3aed;
+  --hs-violet-bright: #8b5cf6;
+  --hs-node: #ffffff;
+  --hs-surface: #f8faf6;
+  --hs-hero-glow: rgb(163 230 53 / 0.28);
+  --hs-grid-dot: rgb(11 15 10 / 0.09);
+}
+
+/* Type */
+h1, h2, h3, h4,
+.site-title,
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  font-family: var(--hs-font-display);
+  letter-spacing: -0.02em;
+}
+.site-title { font-weight: 700; color: var(--sl-color-white); }
+
+/* Chrome */
+.header { backdrop-filter: blur(10px); background-color: color-mix(in srgb, var(--sl-color-black) 82%, transparent); }
+:root[data-theme='dark'] .sidebar-pane { background-color: var(--sl-color-black); }
+a[aria-current='page'] { box-shadow: inset 2px 0 0 var(--hs-lime); }
+
+/* Lime buttons with dark text read better than the default */
+.sl-link-button.primary {
+  background: var(--hs-lime);
+  border-color: var(--hs-lime);
+  color: #0a0d0a;
+  font-weight: 600;
+  box-shadow: 0 0 0 0 var(--hs-lime-shadow);
+  transition: box-shadow 0.2s, transform 0.2s;
+}
+.sl-link-button.primary:hover {
+  color: #0a0d0a;
+  box-shadow: 0 0.4rem 1.6rem -0.3rem var(--hs-lime-shadow);
+  transform: translateY(-1px);
+}
+.sl-link-button.secondary { border-color: var(--hs-lime-line); }
+
+/* Content */
+.sl-markdown-content code:not(:where(.not-content *, pre *)) {
+  background: var(--hs-lime-wash);
+  border: 1px solid var(--hs-lime-line);
+  border-radius: 0.3rem;
+  padding: 0.05em 0.35em;
+}
+.sl-markdown-content table { font-size: var(--sl-text-sm); }
+.sl-markdown-content th { color: var(--sl-color-white); }
+
+/* Splash: no page chrome background, room for full-width sections */
+[data-has-hero] .content-panel { border: none; }
+[data-has-hero] .main-pane { overflow-x: clip; }

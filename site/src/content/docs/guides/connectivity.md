@@ -1,0 +1,108 @@
+---
+title: Connectivity
+description: TURN relays, nearby players, ICE restarts, connection badges and what iPhones and iPads do to your connections.
+---
+
+Handshake only sets up connections. Game data goes straight between the host and each guest over WebRTC, or through a TURN relay when a direct path is not possible. This page covers how that works and what you need to configure.
+
+## TURN is not optional
+
+Players on cellular networks (carrier-grade NAT), strict corporate or school Wi-Fi, or guest Wi-Fi with client isolation often cannot connect to each other directly, even when they sit in the same room. A TURN server relays their traffic instead. Expect roughly 10 to 20% of internet sessions to need it. Without TURN those players simply fail to connect.
+
+Run [coturn](https://github.com/coturn/coturn) next to Handshake (see [Self-hosting](/guides/self-hosting/)). Handshake never relays game traffic itself; it only hands out short-lived TURN credentials.
+
+## Turning it on
+
+Three things must line up:
+
+1. A `[turn]` section in the server config with the URLs to offer and the credential lifetime.
+2. `turn = true` on the app.
+3. The `TURN_SECRET` environment variable, equal to coturn's `static-auth-secret`.
+
+```toml
+[turn]
+urls = [
+  "stun:turn.example.com:3478",
+  "turn:turn.example.com:3478?transport=udp",
+  "turn:turn.example.com:3478?transport=tcp",
+  "turns:turn.example.com:443?transport=tcp",
+]
+ttl_secs = 3600
+
+[apps.my-game]
+origins = ["https://you.github.io"]
+turn = true
+```
+
+Offer `turn:` over both UDP and TCP on 3478, plus `turns:` (TLS) on 443 for networks that block everything but HTTPS. See the [config reference](/reference/config/).
+
+`POST /session` tells the client whether TURN is available (`"turn": true` only when all three are in place). If the app has `turn = true` but the server has no `[turn]` section or no `TURN_SECRET`, `/session` reports `"turn": false` and `/turn` answers `503 turn_unconfigured`; the server logs a warning at startup when `[turn]` is set without `TURN_SECRET`.
+
+## Credentials
+
+Credentials follow coturn's `use-auth-secret` (TURN REST API) scheme:
+
+- **Username:** `<expiry unix time>:<app id>`, for example `1767225600:my-game`.
+- **Credential:** base64 of HMAC-SHA1 over the username, keyed with `TURN_SECRET`.
+- **Lifetime:** `ttl_secs`, default 1 hour.
+
+coturn checks them on its own; there is no call back to Handshake. Because the app ID is in the username, coturn's logs attribute relay usage per app, and its quotas (`user-quota`, `total-quota`, `max-bps`) can limit it.
+
+The JS client fetches credentials from `POST /turn` before creating or joining a room, renews them about a minute before they expire, and pushes the new ones into open peer connections. If the fetch fails, it logs a warning and carries on without TURN. See the [HTTP API](/reference/http/).
+
+## Nearby players
+
+The server marks a player **nearby** when their public IP matches the host's: the exact address for IPv4, the same /64 prefix for IPv6. That usually means "on the same home network". The host's own entry is always nearby. You see it as `peer.nearby` and in each entry of `room.members`.
+
+:::caution
+Behind a reverse proxy, the server reads the real client address from `X-Forwarded-For`, but only when the proxy's address is in `trusted_proxies` (loopback and private networks by default). If your proxy connects from a public address, add it there. Otherwise every player looks like the proxy and everyone is nearby. See [Self-hosting](/guides/self-hosting/#server-config).
+:::
+
+### relayUnlessNearby
+
+```js
+const hs = new Handshake({ server, app, version: 1, relayUnlessNearby: true });
+```
+
+With this option the client connects to any player who is **not** nearby only through TURN (`iceTransportPolicy: "relay"`). Neither side then sees the other's IP address, which matters when strangers can join from a public room. Nearby players still connect directly.
+
+Two consequences:
+
+- Every non-nearby connection is relayed, so it costs TURN bandwidth and needs TURN to work. If TURN is not configured, those players cannot connect at all.
+- "Same public IP" is a network fact, not an identity check. Players behind the same carrier NAT can share a public IP and count as nearby.
+
+## Network changes and ICE restart
+
+When a phone switches between Wi-Fi and cellular, its peer connections break. The client restarts ICE on its own:
+
+- when a peer connection's state becomes `failed`, and
+- for every peer connection when the browser fires `online`.
+
+The host makes a new offer with an ICE restart; a guest asks the host to. The new offer and candidates go over the signaling socket, which stays open for the whole session for exactly this reason. If the socket is down too, the messages wait until the client has resumed (see [Rooms](/guides/rooms/#lifecycle-and-resume)).
+
+## Connection type badge
+
+Each peer reports whether its connection is direct or relayed:
+
+```js
+room.on('peer', peer => {
+  showBadge(peer.id, peer.connectionType);         // 'direct', 'relayed' or null
+  peer.on('type', type => showBadge(peer.id, type)); // when it changes
+});
+```
+
+The client reads `getStats()` when the connection opens and every 5 seconds after that. `connectionType` is `'relayed'` when either end of the selected candidate pair is a TURN relay, and `null` until a pair is selected. The helper is exported if you want to run it on your own stats:
+
+```js
+import { connectionType } from './handshake.js';
+connectionType(await pc.getStats()); // 'direct' | 'relayed' | null
+```
+
+## iOS realities
+
+Most players are on iPhones and iPads. Plan for them:
+
+- **Backgrounding or locking the screen suspends JavaScript** and drops the connections. The client requests a [Screen Wake Lock](https://developer.mozilla.org/docs/Web/API/Screen_Wake_Lock_API) while you are in a room and the page is visible, asks again when the page becomes visible, and releases it when you leave. Pass `wakeLock: false` to turn that off. The browser can still refuse it (for example in Low Power Mode), so warn players not to switch apps mid-game, and rely on resume for when they do.
+- **Sockets die quietly.** iOS can keep a dead WebSocket looking open; the client's heartbeat detects that and resumes.
+- **Low Power Mode caps rendering at 30 fps**, and phones throttle when they get hot. The host does the most work, so prefer an iPad as host.
+- **Plan for jitter spikes, not average latency.** Wi-Fi and cellular both stall now and then; see [Game networking](/guides/game-networking/) for how to absorb that.
