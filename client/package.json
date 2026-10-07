@@ -1,0 +1,12 @@
+{
+  "name": "handshake-client",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/",
+    "e2e": "e2e/run.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

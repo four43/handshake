@@ -13,6 +13,7 @@ room_max_age_secs = 43200
 idle_room_secs = 1800
 sessions_per_min = 30
 joins_per_min = 20
+app_failed_joins_per_min = 200   # wrong codes or keys per app per minute, all IPs together
 
 [turn]
 urls = [
@@ -41,5 +42,6 @@ turn = true
 origins = ["https://four43.com"]
 max_players = 4
 max_rooms = 20
-public_rooms = false
+public_rooms = true   # joinable with the code alone
+list = "none"         # but never listed: the code is the only way in
 turn = true

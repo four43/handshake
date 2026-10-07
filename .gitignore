@@ -1,3 +1,6 @@
 target/
 config.toml
 .env
+client/node_modules/
+client/test-results/
+client/playwright-report/
