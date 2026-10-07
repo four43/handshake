@@ -23,6 +23,7 @@ jobs:
   test:
     name: Unit and integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -46,6 +47,7 @@ jobs:
     name: Build, test and push the image
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -82,14 +84,27 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
+      - name: Playwright version
+        id: pw
+        working-directory: client
+        run: |
+          npm ci
+          echo "version=$(npx playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Headless Chromium
+        working-directory: client
+        # Only the browser, from Playwright's CDN: the runner image already has Chromium's system libraries (it ships Google
+        # Chrome), so no apt-get. --with-deps once hung for minutes on an unreachable Ubuntu mirror.
+        run: npx playwright install --only-shell chromium
       - name: End-to-end test (two Chromium pages over WebRTC through the image)
+        timeout-minutes: 10
         working-directory: client
         env:
           IMAGE: handshake:ci
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-          npm run e2e
+        run: npm run e2e
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
