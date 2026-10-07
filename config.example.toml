@@ -1,0 +1,38 @@
+# peer-helper configuration. Secrets come from env vars, never this file:
+#   SESSION_SECRET (required, 32+ chars), SESSION_SECRET_PREV (optional, for rotation)
+#   TURN_SECRET (must match coturn's static-auth-secret)
+
+listen = "0.0.0.0:8080"
+trust_proxy = true        # read client IP from X-Forwarded-For (Caddy in front)
+allow_localhost = false   # true only for local development
+
+[limits]
+session_ttl_secs = 900
+grace_secs = 30
+room_max_age_secs = 43200
+idle_room_secs = 1800
+sessions_per_min = 30
+joins_per_min = 20
+
+[turn]
+urls = [
+  "stun:turn.example.com:3478",
+  "turn:turn.example.com:3478?transport=udp",
+  "turn:turn.example.com:3478?transport=tcp",
+  "turns:turn.example.com:443?transport=tcp",
+]
+ttl_secs = 3600
+
+[apps.pig-pens]
+origins = ["https://seth.github.io"]
+max_players = 8
+max_rooms = 50
+public_rooms = true
+turn = true
+
+[apps.skerry-island]
+origins = ["https://seth.github.io"]
+max_players = 4
+max_rooms = 20
+public_rooms = false
+turn = true
