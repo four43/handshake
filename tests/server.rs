@@ -1063,3 +1063,99 @@ async fn successful_joins_do_not_count_toward_app_limit() {
     s.client("game", 1).await.join(&room).await;
     s.client("game", 1).await.join(&room).await;
 }
+
+#[tokio::test]
+async fn peek_describes_room_without_joining() {
+    let s = start().await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true, "name": "Farm", "max_players": 2 })).await;
+
+    let mut c = s.client("game", 1).await;
+    c.send(json!({ "t": "peek", "code": room["code"].as_str().unwrap().to_lowercase() })).await;
+    assert_eq!(
+        c.expect("room_info").await,
+        json!({ "t": "room_info", "code": room["code"], "name": "Farm", "players": 1, "max_players": 2, "locked": false, "full": false })
+    );
+    host.quiet().await; // a peek is invisible to the host
+
+    c.join(&room).await;
+    host.expect("peer_joined").await;
+    let mut d = s.client("game", 1).await;
+    d.send(json!({ "t": "peek", "code": room["code"] })).await;
+    let info = d.expect("room_info").await;
+    assert_eq!((&info["players"], &info["full"]), (&json!(2), &json!(true)));
+
+    host.send(json!({ "t": "lock", "locked": true })).await;
+    host.expect("room_meta").await;
+    d.send(json!({ "t": "peek", "code": room["code"] })).await;
+    assert_eq!(d.expect("room_info").await["locked"], true);
+
+    c.expect("room_meta").await; // c is in the room, so it heard the lock too
+    c.send(json!({ "t": "peek", "code": room["code"] })).await;
+    c.expect_error("already_in_room").await;
+}
+
+#[tokio::test]
+async fn peek_rejections_share_the_join_budget() {
+    let s = start_limits("joins_per_min = 3").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+
+    let mut c = s.client_at("game", 2, Some("203.0.113.5")).await;
+    c.send(json!({ "t": "peek", "code": "ZZZZZ" })).await;
+    c.expect_error("not_found").await;
+    c.send(json!({ "t": "peek", "code": room["code"] })).await;
+    c.expect_error("version_mismatch").await;
+    c.send(json!({ "t": "peek", "code": room["code"] })).await;
+    c.expect_error("version_mismatch").await;
+    // Three peeks used this IP's three attempts: the next join is refused.
+    c.send(json!({ "t": "join", "code": room["code"] })).await;
+    c.expect_error("rate_limited").await;
+
+    let metrics = s.http.get(s.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.contains("handshake_joins_rejected_total 4"), "{metrics}");
+}
+
+#[tokio::test]
+async fn peek_private_room_needs_its_key() {
+    let s = start_limits("app_failed_joins_per_min = 2").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": false })).await;
+
+    let mut c = s.client_at("game", 1, Some("198.51.100.1")).await;
+    c.send(json!({ "t": "peek", "code": room["code"] })).await;
+    c.expect_error("bad_key").await;
+    c.send(json!({ "t": "peek", "code": room["code"], "key": "wrong" })).await;
+    c.expect_error("bad_key").await;
+    let metrics = s.http.get(s.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.contains("handshake_joins_rejected_total 2"), "{metrics}");
+
+    // Two bad keys used the app's failure budget: now even the right key is refused, from any IP.
+    let mut d = s.client_at("game", 1, Some("203.0.113.9")).await;
+    d.send(json!({ "t": "peek", "code": room["code"], "key": room["key"] })).await;
+    d.expect_error("rate_limited").await;
+}
+
+#[tokio::test]
+async fn peek_private_room_with_its_key() {
+    let s = start().await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": false, "name": "Secret" })).await;
+    let mut c = s.client("game", 1).await;
+    c.send(json!({ "t": "peek", "code": room["code"], "key": room["key"] })).await;
+    let info = c.expect("room_info").await;
+    assert_eq!((&info["name"], &info["players"]), (&json!("Secret"), &json!(1)));
+}
+
+#[tokio::test]
+async fn failed_peeks_count_toward_app_limit() {
+    let s = start_limits("app_failed_joins_per_min = 1").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+    let mut c = s.client_at("game", 1, Some("198.51.100.1")).await;
+    c.send(json!({ "t": "peek", "code": "ZZZZZ" })).await;
+    c.expect_error("not_found").await;
+    let mut good = s.client_at("game", 1, Some("203.0.113.9")).await;
+    good.send(json!({ "t": "peek", "code": room["code"] })).await;
+    good.expect_error("rate_limited").await;
+}

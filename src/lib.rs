@@ -276,6 +276,11 @@ enum In {
     Resume {
         token: String,
     },
+    Peek {
+        code: String,
+        #[serde(default)]
+        key: Option<String>,
+    },
     List,
     Signal {
         to: PeerId,
@@ -780,6 +785,41 @@ impl App {
                 } else {
                     room.send_host(conns, &json!({ "t": "peer_back", "peer": peer }));
                 }
+            }
+
+            In::Peek { code, key } => {
+                let reject = |conns: &mut Conns, code: &str, message: &str| {
+                    self.metrics.joins_rejected.fetch_add(1, Ordering::Relaxed);
+                    conns.error(conn, code, message);
+                };
+                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &app_id) {
+                    return reject(conns, code, message);
+                }
+                let code = code.trim().to_ascii_uppercase();
+                let Some(room) = app_rooms.get(&code) else {
+                    app_fail(app_fails, &app_id);
+                    return reject(conns, "not_found", "no room with that code");
+                };
+                if room.version != version {
+                    return reject(conns, "version_mismatch", "that room runs a different game version");
+                }
+                if !room.public && !key.as_deref().is_some_and(|k| ct_eq(k, &room.key)) {
+                    app_fail(app_fails, &app_id);
+                    return reject(conns, "bad_key", "invalid room key");
+                }
+                let players = room.members.len();
+                conns.send(
+                    conn,
+                    &json!({
+                        "t": "room_info",
+                        "code": room.code,
+                        "name": room.name,
+                        "players": players,
+                        "max_players": room.max_players,
+                        "locked": room.locked,
+                        "full": players >= room.max_players as usize,
+                    }),
+                );
             }
 
             In::List => {
