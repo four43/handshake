@@ -224,6 +224,7 @@ struct Member {
     resume: String,
     conn: Option<ConnId>,
     away_since: Option<Instant>,
+    ip_group: String, // at join time; compared with the room's host_ip_group for `nearby`
 }
 
 #[derive(Deserialize)]
@@ -356,7 +357,9 @@ impl Room {
         let peers: Vec<Value> = self
             .members
             .iter()
-            .map(|m| json!({ "id": m.id, "name": m.name, "away": m.away_since.is_some() }))
+            .map(|m| {
+                json!({ "id": m.id, "name": m.name, "away": m.away_since.is_some(), "nearby": m.ip_group == self.host_ip_group })
+            })
             .collect();
         json!({
             "t": "joined",
@@ -654,6 +657,7 @@ impl App {
                         resume: host_resume.clone(),
                         conn: Some(conn),
                         away_since: None,
+                        ip_group: ip_group.clone(),
                     }],
                     host_ip_group: ip_group,
                     created: Instant::now(),
@@ -702,12 +706,18 @@ impl App {
                     resume: peer_resume.clone(),
                     conn: Some(conn),
                     away_since: None,
+                    ip_group: ip_group.clone(),
                 });
+                let nearby = ip_group == room.host_ip_group;
                 room.alone_since = None;
                 resume.insert(peer_resume, (app_id.clone(), code.clone(), peer.clone()));
                 conns.bind(conn, &code, &peer);
                 conns.send(conn, &room.view(&peer, false));
-                room.broadcast(conns, &json!({ "t": "peer_joined", "peer": peer, "name": name }), Some(&peer));
+                room.broadcast(
+                    conns,
+                    &json!({ "t": "peer_joined", "peer": peer, "name": name, "nearby": nearby }),
+                    Some(&peer),
+                );
                 info!(app = %app_id, room = %code, peer = %peer, "peer joined");
             }
 

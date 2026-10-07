@@ -495,7 +495,7 @@ async fn create_and_join_private() {
     assert_eq!(hroom["host"], hroom["you"]);
     assert!(hroom["key"].as_str().is_some_and(|k| !k.is_empty()));
     assert!(hroom["resume"].as_str().is_some_and(|r| !r.is_empty()));
-    assert_eq!(hroom["peers"], json!([{ "id": hroom["you"], "name": "Seth", "away": false }]));
+    assert_eq!(hroom["peers"], json!([{ "id": hroom["you"], "name": "Seth", "away": false, "nearby": true }]));
 
     // Missing or wrong key.
     let mut peer = s.client("game", 1).await;
@@ -516,10 +516,10 @@ async fn create_and_join_private() {
     assert!(proom["key"].is_null(), "only the host sees the key");
     assert_ne!(proom["resume"], hroom["resume"]);
     assert_eq!(proom["peers"].as_array().unwrap().len(), 2);
-    assert_eq!(proom["peers"][1], json!({ "id": proom["you"], "name": "Ana", "away": false }));
+    assert_eq!(proom["peers"][1], json!({ "id": proom["you"], "name": "Ana", "away": false, "nearby": true }));
 
     let joined = host.expect("peer_joined").await;
-    assert_eq!(joined, json!({ "t": "peer_joined", "peer": proom["you"], "name": "Ana" }));
+    assert_eq!(joined, json!({ "t": "peer_joined", "peer": proom["you"], "name": "Ana", "nearby": true }));
     peer.quiet().await;
 }
 
@@ -1008,4 +1008,23 @@ async fn list_none_hides_public_rooms() {
     // Still joinable with the code alone.
     lister.send(json!({ "t": "join", "code": room["code"] })).await;
     lister.expect("joined").await;
+}
+
+#[tokio::test]
+async fn players_carry_nearby_flag() {
+    let s = start().await;
+    let mut host = s.client_at("game", 1, Some("203.0.113.5")).await;
+    let room = host.create(json!({ "public": true })).await;
+    assert_eq!(room["peers"][0]["nearby"], true);
+
+    let mut near = s.client_at("game", 1, Some("203.0.113.5")).await;
+    near.join(&room).await;
+    assert_eq!(host.expect("peer_joined").await["nearby"], true);
+
+    let mut far = s.client_at("game", 1, Some("198.51.100.7")).await;
+    let far_view = far.join(&room).await;
+    assert_eq!(host.expect("peer_joined").await["nearby"], false);
+    assert_eq!(near.expect("peer_joined").await["nearby"], false);
+    let flags: Vec<&Value> = far_view["peers"].as_array().unwrap().iter().map(|p| &p["nearby"]).collect();
+    assert_eq!(flags, [&json!(true), &json!(true), &json!(false)]);
 }
