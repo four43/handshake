@@ -1,4 +1,4 @@
-// handshake.js: the browser client for the Handshake signaling server (SPEC.md, "JS client library").
+// handshake.js: the browser client for the Handshake signaling server (docs/specs/handshake-server.md, "JS client library").
 // One plain ES module with no dependencies; each game keeps a copy. The server matches players into
 // rooms and relays WebRTC signaling; game data goes peer to peer (host <-> each guest) over two data
 // channels: `state` (unordered, no resends) and `events` (reliable, ordered).

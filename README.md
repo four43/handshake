@@ -3,7 +3,7 @@
 A small WebRTC signaling server and room registry for four43.com browser games, plus the browser
 client every game uses (`client/handshake.js`). It matches players into rooms and relays connection
 setup; game data then goes peer to peer (host to each guest), through a TURN relay when it must.
-The server never sees game data. `SPEC.md` is the design.
+The server never sees game data. `docs/specs/handshake-server.md` is the design.
 
 ## Test
 
@@ -34,7 +34,7 @@ environment, never the file: `SESSION_SECRET` (required, 32+ characters), `SESSI
 
 One Docker host runs Caddy (TLS, proxies `/session`, `/turn` and `/ws` to port 8080; keep `/metrics`
 internal), this server and coturn (`network_mode: host`, a narrow relay port range, `external-ip`
-behind NAT). See SPEC.md "Architecture and deployment" for the compose file.
+behind NAT). See `docs/specs/handshake-server.md` "Architecture and deployment" for the compose file.
 
 - The container runs as `nonroot`: mount `config.toml` with mode 644 (`chmod 644 config.toml`), or it
   cannot read it.
