@@ -771,3 +771,17 @@ test('a candidate that cannot be added is warned about once', async t => {
   assert.equal(warn.mock.calls.filter(c => c.arguments.some(a => String(a).includes('candidate'))).length, 1);
   h.hs.close();
 });
+
+test('a guest with no connection asks again when the host comes back (its first ask found the host away)', async () => {
+  const env = fakeEnv(), { hs, ws } = await guesting(env);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
+  await ws.next('signal');
+  env.pcs[0].remoteChannels(); env.pcs[0].channels.forEach(c => c.open());
+  ws.push({ t: 'host_away', grace_secs: 30 });
+  env.pcs[0].channels[0].close();
+  assert.deepEqual((await ws.next('signal')).data, { restart: true, rebuild: true });
+  ws.push({ t: 'error', code: 'peer_unavailable', message: 'that peer is not connected', re: 'signal' });
+  ws.push({ t: 'host_back' });
+  assert.deepEqual((await ws.next('signal')).data, { restart: true, rebuild: true });
+  hs.close();
+});

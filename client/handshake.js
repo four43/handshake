@@ -290,7 +290,7 @@ export class Handshake {
     }
     const current = Date.now() < this.#iceUntil;
     if (needed && !current) throw new HandshakeError('no_turn', `no TURN credentials: ${error.message}`);
-    console.warn('handshake: no TURN credentials', error);
+    warnOnce('no TURN credentials', error);
     return current ? this.#ice : [];
   }
 
@@ -376,7 +376,7 @@ export class Handshake {
       // `re` names the request this error answers; an older server sends none (see ERROR_REQUESTS)
       const w = this.#waiters.find(x => x.errors && (m.re ? x.re === m.re : !ERROR_REQUESTS[m.code] || ERROR_REQUESTS[m.code].includes(x.re)));
       if (w) { this.#drop(w); w.reject(new HandshakeError(m.code, m.message)); }
-      else console.warn('handshake:', m.code, m.message);
+      else warnOnce(`server error ${m.code}${m.re ? ` (${m.re})` : ''}`, m.message); // e.g. ICE candidates to a peer who is away
       return;
     }
     const w = this.#waiters.find(x => x.want === m.t && (!x.match || x.match(m)));
@@ -589,7 +589,12 @@ class Room extends Emitter {
         this.emit('members', this.members);
         break;
       case 'host_away': this.#setAway(this.hostId, true); this.emit('hostAway', m.grace_secs); this.emit('members', this.members); break;
-      case 'host_back': this.#setAway(this.hostId, false); this.emit('hostBack'); this.emit('members', this.members); break;
+      case 'host_back':
+        this.#setAway(this.hostId, false);
+        if (!this.isHost && !this.peers.has(this.hostId)) this.#lost(this.hostId); // an ask while the host was away found nobody
+        this.emit('hostBack');
+        this.emit('members', this.members);
+        break;
       case 'room_meta':
         this.locked = !!m.locked;
         this.meta = m.meta ?? null;

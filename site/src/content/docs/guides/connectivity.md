@@ -83,7 +83,7 @@ The host makes a new offer with an ICE restart; a guest asks the host to. The ne
 When an ICE restart is too late and a data channel closes (an iPad in the background for half a minute, say), the peer connection is gone: its `close` event fires and it leaves `room.peers`. A channel that closes before both channels opened counts too. The client then builds a new connection by itself:
 
 - The host makes a new one to that guest at once, or when the guest comes back (`peerBack`) if its socket is down. A guest whose connections keep failing waits longer between tries (2, 5, then 15 seconds), until one opens.
-- A guest asks the host for a new one (`{restart: true, rebuild: true}` in a signal), queued until its socket has resumed.
+- A guest asks the host for a new one (`{restart: true, rebuild: true}` in a signal), queued until its socket has resumed, and asks again when the host comes back (`hostBack`) if it still has none.
 
 The first offer of every connection is marked `new: true`, so a guest that still holds an old connection replaces it. The new connection arrives as another `peer` event with the same peer id.
 
