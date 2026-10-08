@@ -29,13 +29,13 @@ No `[turn]` section is needed for two tabs on one machine. See [Connectivity](/g
 
 ## 2. Run the server
 
-Images are published to the GitHub Container Registry. A push to `main` publishes `ghcr.io/four43/handshake:<short commit hash>`; a git tag publishes `ghcr.io/four43/handshake:<tag>`. There is no `latest` tag, so pick one from the [package page](https://github.com/four43/handshake/pkgs/container/handshake), for example `ghcr.io/four43/handshake:577b002`. Images are public; no login is needed.
+Images are published to the GitHub Container Registry and are public, so no login is needed. `ghcr.io/four43/handshake:v1` is always the newest 1.x release; pin an exact release such as `:v1.0.0` if you prefer. Every push to `main` also publishes `:<short commit hash>`. See the [package page](https://github.com/four43/handshake/pkgs/container/handshake) for all tags.
 
 ```bash
 docker run --rm -p 8080:8080 \
   -e SESSION_SECRET=$(openssl rand -hex 32) \
   -v "$PWD/config.toml:/etc/handshake/config.toml:ro" \
-  ghcr.io/four43/handshake:<tag>
+  ghcr.io/four43/handshake:v1
 ```
 
 Or build the image from a checkout of the repository:

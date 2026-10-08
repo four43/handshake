@@ -52,7 +52,7 @@ export default defineConfig({
           description:
             'Handshake is a small self-hosted WebRTC signaling server (Rust) and room registry for browser games, plus a dependency-free JavaScript client (`handshake.js`). It matches players into rooms by join code, relays connection setup (SDP/ICE) and mints TURN credentials; game data then flows peer to peer, host to each guest, and never touches the server.',
           details: [
-            '- Source: https://github.com/four43/handshake. Server image: `ghcr.io/four43/handshake:<tag>` (short commit hash from main, or a git tag).',
+            '- Source: https://github.com/four43/handshake. Server image: `ghcr.io/four43/handshake:v1` (the newest 1.x release; `:vX.Y.Z` pins one, `:<short hash>` is a build of main).',
             '- Games use the JS client; the WebSocket protocol and HTTP API are for writing other clients or debugging.',
             '- Topology is a star: the host talks to each guest; guests never connect to each other.',
             '- The client API reference is generated from `client/handshake.js`; the protocol and config references from the Rust types in `src/lib.rs`.',

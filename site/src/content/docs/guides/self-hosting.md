@@ -28,7 +28,7 @@ services:
       - caddy_data:/data
 
   handshake:
-    image: ghcr.io/four43/handshake:<tag>
+    image: ghcr.io/four43/handshake:v1   # newest 1.x; or pin e.g. :v1.0.0
     restart: unless-stopped
     environment:
       SESSION_SECRET: ${SESSION_SECRET}

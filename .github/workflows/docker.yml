@@ -1,5 +1,6 @@
 # Test, build and publish the server image to ghcr.io/four43/handshake.
-# Pull requests run everything but the push. A push to main publishes :<short hash> (e.g. :6fd9bf2); a git tag publishes :<tag> (e.g. :v1.0.0).
+# Pull requests run everything but the push. A push to main publishes :<short hash> (e.g. :6fd9bf2); a git tag publishes :<tag>
+# (e.g. :v1.2.3), and a release tag vX.Y.Z that is the newest of its major also moves :vX (e.g. :v1), so :v1 is the latest 1.x.
 name: Docker image
 
 on:
@@ -53,13 +54,28 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # every tag, to find the newest release of this major
       - uses: docker/setup-buildx-action@v4
+      - name: Major tag
+        id: major
+        # Only for a release tag (vX.Y.Z, no pre-release) that is the newest vX.*, so an old patch never moves :vX back.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if [[ "$tag" =~ ^(v[0-9]+)\.[0-9]+\.[0-9]+$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            newest=$(git tag -l "$major.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+            if [ "$tag" = "$newest" ]; then echo "tag=$major" >> "$GITHUB_OUTPUT"; else echo "$tag is older than $newest: :$major stays"; fi
+          fi
       - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
+          flavor: latest=false # no :latest; :vX is the moving tag
           tags: |
             type=sha,prefix=,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.major.outputs.tag }},enable=${{ steps.major.outputs.tag != '' }}
             type=ref,event=tag
       - name: Build
         uses: docker/build-push-action@v7
