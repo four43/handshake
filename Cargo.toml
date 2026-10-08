@@ -3,6 +3,8 @@ name = "handshake"
 version = "0.1.0"
 edition = "2021"
 description = "WebRTC signaling and room registry for browser games"
+license = "BUSL-1.1"
+repository = "https://github.com/four43/handshake"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }

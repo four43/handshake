@@ -62,6 +62,8 @@ The client is one ES module with no dependencies and no build step. Copy [`clien
 curl -O https://raw.githubusercontent.com/four43/handshake/main/client/handshake.js
 ```
 
+The client is MIT-licensed, so it can go into any game, open or closed source. Keep the license header at the top of the file.
+
 Then import it:
 
 ```js

@@ -123,3 +123,22 @@ against that exact image, then pushes it to the GitHub Container Registry. Pull 
 ```bash
 git tag v1.2.3 && git push origin v1.2.3        # publishes :v1.2.3 and moves :v1
 ```
+
+## Contributing and license
+
+Everyone is welcome to use Handshake, self-host it, host it for others and contribute to it. Just don't charge
+to host it for others.
+
+- **Self-host it:** run, modify and deploy the server for your own games, free or commercial.
+- **Host it for others:** run a public Handshake server for other developers, as long as it's free.
+- **Use the client anywhere:** vendor `handshake.js` into any game, open or closed source. Keep its license header.
+- **Contribute:** issues and pull requests are welcome. Run the tests in [Development](#development) first.
+- **Not allowed:** charging others to host Handshake for them, or removing its license notices.
+
+The server and the rest of this repository are under the [Business Source License 1.1](LICENSE) (BSL); the browser
+client, [`client/handshake.js`](client/handshake.js), is [MIT](client/LICENSE). Each release of the server becomes
+GPLv3 four years after it is published. The license files are what count; the list above is a summary.
+
+By submitting a contribution you license it under the license of the files it changes, and you also grant Seth
+Miller a perpetual, worldwide, royalty-free, irrevocable license to use, modify, sublicense and distribute it
+under any terms, including as part of a paid hosted service. This keeps the project able to offer hosted Handshake.

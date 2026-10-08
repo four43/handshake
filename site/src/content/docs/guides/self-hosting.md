@@ -175,3 +175,7 @@ Rooms, resume tokens and rate-limit counters are kept in memory. A restart or re
 There is no shared store, so run exactly one instance. One small server handles signaling for many games; game traffic never passes through it.
 
 See also the [HTTP API](/reference/http/) for what Caddy is proxying.
+
+## License
+
+The server is under the [Business Source License 1.1](https://github.com/four43/handshake/blob/main/LICENSE): you may run, modify and self-host it for your own games, commercial ones included, and host it for others free of charge. Charging others to host it is not allowed. Each release becomes GPLv3 four years after it is published. The client, `handshake.js`, is [MIT](https://github.com/four43/handshake/blob/main/client/LICENSE).

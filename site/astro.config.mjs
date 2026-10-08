@@ -55,6 +55,7 @@ export default defineConfig({
             '- Source: https://github.com/four43/handshake. Server image: `ghcr.io/four43/handshake:v1` (the newest 1.x release; `:vX.Y.Z` pins one, `:<short hash>` is a build of main).',
             '- Games use the JS client; the WebSocket protocol and HTTP API are for writing other clients or debugging.',
             '- Topology is a star: the host talks to each guest; guests never connect to each other.',
+            '- License: the server is Business Source License 1.1. Self-host it for your own games (commercial ones included) and host it for others free of charge; only charging to host it for others is reserved. Each release becomes GPLv3 four years after it is published. The client `handshake.js` is MIT, free to vendor into any game.',
             '- The client API reference is generated from `client/handshake.js`; the protocol and config references from the Rust types in `src/lib.rs`.',
             '',
             'Key pages:',

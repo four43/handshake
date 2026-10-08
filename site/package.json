@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "description": "Docs site for Handshake",
+  "license": "BUSL-1.1",
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
