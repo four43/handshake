@@ -49,7 +49,7 @@ export function fakeEnv({ turn = true } = {}) {
       return json(200, { token: `tok${env.sessionCount}`, expires_in: env.expiresIn, turn: env.turn });
     }
     if (path === '/turn' && env.turnFailures > 0) { env.turnFailures--; return json(503, {}); }
-    if (path === '/turn') return json(200, { ice_servers: [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }], ttl: 3600 });
+    if (path === '/turn') return json(200, { ice_servers: env.iceServers ?? [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }], ttl: 3600 });
     return json(404, { error: 'not_found' });
   };
 

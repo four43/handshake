@@ -697,6 +697,16 @@ test('relayUnlessNearby: a failed TURN fetch is tried once more, then createRoom
   hs2.close();
 });
 
+test('relayUnlessNearby: TURN credentials with only STUN servers (no turn: URL) fail with no_turn, not a connection that never comes', async () => {
+  const env = fakeEnv(); env.iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+  const hs = make(env, { relayUnlessNearby: true });
+  await assert.rejects(hs.joinRoom('K7MX2'), e => e.code === 'no_turn' && /turn: URL/.test(e.message));
+  await assert.rejects(hs.createRoom(), { code: 'no_turn' });
+  hs.close();
+  const env2 = fakeEnv(); env2.iceServers = [{ urls: ['stun:s.test:3478', 'turns:t.test:443?transport=tcp'] }];
+  const h = await hosting(env2, { relayUnlessNearby: true }); h.hs.close(); // a turns: URL is a relay
+});
+
 test('relayUnlessNearby with a session that offers no TURN fails with no_turn', async () => {
   const env = fakeEnv({ turn: false }), hs = make(env, { relayUnlessNearby: true });
   await assert.rejects(hs.joinRoom('K7MX2'), { code: 'no_turn' });

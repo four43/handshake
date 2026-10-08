@@ -70,6 +70,8 @@ const parse = text => { try { return JSON.parse(text); } catch { return null; } 
 const warned = new Set();
 /** console.warn once per `kind`: a failure that repeats (every candidate, every heartbeat) is logged, never a flood. */
 const warnOnce = (kind, ...args) => { if (warned.has(kind)) return; warned.add(kind); console.warn('handshake:', kind, ...args); };
+/** True when at least one ICE server is a TURN relay (a turn: or turns: URL); STUN alone cannot carry a relay-only connection. */
+const hasRelay = servers => (servers ?? []).some(s => [].concat(s?.urls ?? []).some(u => /^turns?:/i.test(String(u))));
 const member = p => ({ id: p.id, name: p.name ?? '', nearby: !!p.nearby, away: !!p.away });
 
 /**
@@ -282,11 +284,12 @@ export class Handshake {
     for (let i = 0; i < 2; i++) {
       try {
         const t = await this.#post('/turn', null, this.#token);
+        if (needed && !hasRelay(t.ice_servers)) throw new HandshakeError('no_turn', 'the server\'s ICE servers have no turn: URL (only STUN), so a relay-only connection can never be made');
         this.#ice = t.ice_servers;
         this.#iceUntil = Date.now() + t.ttl * 1000;
         for (const peer of this.#room?.peers.values() ?? []) peer._setIce(this.#ice);
         return this.#ice;
-      } catch (e) { error = e; }
+      } catch (e) { if (e?.code === 'no_turn') throw e; error = e; }
     }
     const current = Date.now() < this.#iceUntil;
     if (needed && !current) throw new HandshakeError('no_turn', `no TURN credentials: ${error.message}`);
