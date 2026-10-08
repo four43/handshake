@@ -104,10 +104,10 @@
       "type": "object",
       "properties": {
         "app_failed_joins_per_min": {
-          "description": "Failed joins and peeks (`not_found`, `bad_key`) per app per minute, across all IPs.",
+          "description": "Failed joins and peeks per app per minute, across all IPs: a ceiling against guessing from many addresses.\nKeep it well above `ip_failed_joins_per_min`, so a few guessing IPs cannot lock out every join.",
           "type": "integer",
           "format": "uint32",
-          "default": 200,
+          "default": 2000,
           "minimum": 0
         },
         "grace_secs": {
@@ -122,6 +122,13 @@
           "type": "integer",
           "format": "uint64",
           "default": 1800,
+          "minimum": 0
+        },
+        "ip_failed_joins_per_min": {
+          "description": "Failed joins and peeks (`not_found`, `bad_key`) per client IP (IPv6: per /64) per app per minute.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 10,
           "minimum": 0
         },
         "joins_per_min": {

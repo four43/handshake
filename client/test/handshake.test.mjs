@@ -214,7 +214,7 @@ test('the host offers to each new guest over two channels and opens when both ar
   const pc = env.pcs[0];
   assert.deepEqual(pc.config, { iceServers: [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }] });
   assert.deepEqual(pc.channels.map(c => [c.label, c.opts]), [['state', { ordered: false, maxRetransmits: 0 }], ['events', { ordered: true }]]);
-  assert.deepEqual(await ws.next('signal'), { t: 'signal', to: 'G', data: { sdp: { type: 'offer', sdp: 'offer1' } } });
+  assert.deepEqual(await ws.next('signal'), { t: 'signal', to: 'G', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
 
   pc.ice({ candidate: 'c1' });
   assert.deepEqual((await ws.next('signal')).data, { candidate: { candidate: 'c1' } });
@@ -541,4 +541,262 @@ test('host controls: not_host for a guest, network while the socket is down, tim
     await assert.rejects(locking, { code: 'timeout' });
     t.hs.close();
   } finally { mock.timers.reset(); }
+});
+
+// ---- reconnecting a dropped peer (C-1) ----------------------------------------
+
+/** Host with guest G (nearby): the offer is out. */
+async function hostWithGuest(env, opts) {
+  const h = await hosting(env, opts);
+  h.ws.push({ t: 'peer_joined', peer: 'G', name: 'Player', nearby: true });
+  await h.ws.next('signal');
+  return h;
+}
+
+test('the first offer to a guest is marked new; an ICE restart offer is not', async () => {
+  const env = fakeEnv(), h = await hostWithGuest(env);
+  assert.equal(h.ws.sent.find(m => m.t === 'signal').data.new, true);
+  env.pcs[0].state('failed');
+  const again = await h.ws.next('signal');
+  assert.equal(again.data.new, undefined);
+  h.hs.close();
+});
+
+test('a channel that closes before both open closes the peer, and the host offers again', async () => {
+  const env = fakeEnv(), h = await hostWithGuest(env), closes = [];
+  const first = h.room.peers.get('G');
+  first.on('close', () => closes.push('G'));
+  env.pcs[0].channels[0].close(); // never opened
+  assert.deepEqual([closes, env.pcs[0].closed], [['G'], true]);
+  const offer = await h.ws.next('signal');
+  assert.deepEqual([offer.to, offer.data.new, env.pcs.length], ['G', true, 2]);
+  assert.notEqual(h.room.peers.get('G'), first);
+  h.hs.close();
+});
+
+test('the host rebuilds a closed peer when the guest comes back', async () => {
+  const env = fakeEnv(), h = await hostWithGuest(env);
+  env.pcs[0].open();
+  h.ws.push({ t: 'peer_away', peer: 'G' });
+  env.pcs[0].channels[1].close(); // ICE failed while the guest was away
+  assert.equal(h.room.peers.has('G'), false);
+  await new Promise(r => setImmediate(r));
+  assert.equal(env.pcs.length, 1); // no offer to a guest whose socket is down
+  h.ws.push({ t: 'peer_back', peer: 'G' });
+  const offer = await h.ws.next('signal');
+  assert.deepEqual([offer.to, offer.data.new, env.pcs.length], ['G', true, 2]);
+  h.hs.close();
+});
+
+test('the host rebuilds when a guest with no peer asks for a restart, or a guest asks for a new connection', async () => {
+  const env = fakeEnv(), h = await hostWithGuest(env);
+  env.pcs[0].open();
+  h.ws.push({ t: 'peer_away', peer: 'G' });
+  env.pcs[0].channels[0].close();
+  h.ws.push({ t: 'signal', from: 'G', data: { restart: true } }); // the guest's socket resumed first
+  const offer = await h.ws.next('signal');
+  assert.deepEqual([offer.data.new, env.pcs.length], [true, 2]);
+
+  // The guest lost its side: the open peer here is replaced, not ICE-restarted.
+  h.ws.push({ t: 'signal', from: 'G', data: { sdp: { type: 'answer', sdp: 'answer' } } });
+  await until(() => env.pcs[1].remoteDescription);
+  env.pcs[1].open();
+  h.ws.push({ t: 'signal', from: 'G', data: { restart: true, rebuild: true } });
+  const again = await h.ws.next('signal');
+  assert.deepEqual([again.data.new, env.pcs.length, env.pcs[1].closed], [true, 3, true]);
+
+  // A rebuild request while a new offer is still unanswered changes nothing.
+  h.ws.push({ t: 'signal', from: 'G', data: { restart: true, rebuild: true } });
+  await new Promise(r => setImmediate(r));
+  assert.equal(env.pcs.length, 3);
+  h.hs.close();
+});
+
+test('rebuilds back off while a guest keeps failing, and stop when the room closes', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const env = fakeEnv(), h = await hostWithGuest(env);
+    env.pcs[0].channels[0].close();
+    await until(() => env.pcs.length === 2); // the first rebuild is at once
+    env.pcs[1].channels[0].close();
+    await new Promise(r => setImmediate(r));
+    assert.equal(env.pcs.length, 2);
+    mock.timers.tick(2_000);
+    await until(() => env.pcs.length === 3);
+    env.pcs[2].channels[0].close();
+    h.room.leave();
+    mock.timers.tick(60_000);
+    await new Promise(r => setImmediate(r));
+    assert.equal(env.pcs.length, 3);
+    h.hs.close();
+  } finally { mock.timers.reset(); }
+});
+
+test("a guest whose connection closes asks the host for a new one and takes the host's new offer", async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const opened = record(room, ['peer']);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
+  await ws.next('signal');
+  env.pcs[0].remoteChannels(); env.pcs[0].channels.forEach(c => c.open());
+  env.pcs[0].channels[0].close();
+  assert.deepEqual(await ws.next('signal'), { t: 'signal', to: 'H', data: { restart: true, rebuild: true } });
+  assert.equal(room.peers.has('H'), false);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer9' }, new: true } });
+  assert.equal((await ws.next('signal')).data.sdp.type, 'answer');
+  assert.equal(env.pcs.length, 2);
+  env.pcs[1].remoteChannels(); env.pcs[1].channels.forEach(c => c.open());
+  assert.equal(opened.length, 2);
+  hs.close();
+});
+
+test('a guest replaces its peer when the host sends a new offer for a connection it already has', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
+  await ws.next('signal');
+  env.pcs[0].remoteChannels(); env.pcs[0].channels.forEach(c => c.open());
+  const old = room.peers.get('H');
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offerB' }, new: true } }); // the host rebuilt its side
+  await ws.next('signal');
+  assert.deepEqual([env.pcs.length, env.pcs[0].closed, env.pcs[1].remoteDescription.sdp], [2, true, 'offerB']);
+  assert.notEqual(room.peers.get('H'), old);
+  assert.equal(ws.sent.some(m => m.t === 'signal' && m.data.rebuild), false); // a replaced peer asks for nothing
+  hs.close();
+});
+
+test('a guest that loses its connection while its socket is down asks after the resume', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
+  await ws.next('signal');
+  env.pcs[0].remoteChannels(); env.pcs[0].channels.forEach(c => c.open());
+  ws.drop();
+  env.pcs[0].channels[1].close();
+  const ws2 = await until(() => env.sockets[1]);
+  await ws2.next('resume');
+  ws2.push({ t: 'joined', resumed: true, room: guestView({ resume: 'rG2' }) });
+  assert.deepEqual((await ws2.next('signal')).data, { restart: true, rebuild: true });
+  assert.equal(room.closed, false);
+  hs.close();
+});
+
+// ---- TURN required (C-2): only for a guest that is not on the host's network ----------------
+
+// a guest whose 'joined' says it is (or is not) nearby
+async function joinAs(env, nearby, opts = { relayUnlessNearby: true }) {
+  const hs = make(env, opts), pending = hs.joinRoom('k7mx2');
+  const ws = await until(() => env.sockets[0]);
+  await ws.next('join');
+  ws.push({ t: 'joined', resumed: false, room: guestView({ peers: [{ id: 'H', name: 'Host', away: false, nearby: true }, { id: 'G', name: 'Player', away: false, nearby }] }) });
+  return { hs, ws, pending };
+}
+
+test('relayUnlessNearby: a guest on another network with no relay fails with no_turn and leaves; one on the host network joins', async () => {
+  for (const [what, setup] of [
+    ['/turn failed twice', env => { env.turnFailures = 2; }],
+    ['no TURN for the app', env => { env.turn = false; }],
+    ['only STUN servers', env => { env.iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }]; }],
+  ]) {
+    const env = fakeEnv(); setup(env);
+    const far = await joinAs(env, false);
+    await assert.rejects(far.pending, e => e instanceof HandshakeError && e.code === 'no_turn', what);
+    assert.ok((await far.ws.next('leave')), `${what}: the room is left`);
+    far.hs.close();
+    const env2 = fakeEnv(); setup(env2);
+    const near = await joinAs(env2, true);
+    assert.ok(await near.pending, `${what}: a nearby guest joins`);
+    near.hs.close();
+  }
+});
+
+test('relayUnlessNearby: hosting needs no relay (a guest on the host network connects directly)', async () => {
+  const env = fakeEnv(); env.iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+  const h = await hosting(env, { relayUnlessNearby: true }); assert.ok(h.room); h.hs.close();
+  const env2 = fakeEnv({ turn: false }), h2 = await hosting(env2, { relayUnlessNearby: true }); assert.ok(h2.room); h2.hs.close();
+});
+
+test('relayUnlessNearby: a turns: URL counts as a relay', async () => {
+  const env = fakeEnv(); env.iceServers = [{ urls: ['stun:s.test:3478', 'turns:t.test:443?transport=tcp'] }];
+  const far = await joinAs(env, false); assert.ok(await far.pending); far.hs.close();
+});
+
+test('without relayUnlessNearby a failed TURN fetch is a warning and the room still opens', async t => {
+  const warn = t.mock.method(console, 'warn', () => {});
+  const env = fakeEnv();
+  env.turnFailures = 2;
+  const h = await hosting(env);
+  assert.equal(h.room.code, 'K7MX2');
+  assert.ok(warn.mock.callCount() <= 1, 'one warning at most (warnings are logged once per page; an earlier test may have logged it)');
+  h.hs.close();
+});
+
+// ---- send buffer cap (C-3) ----------------------------------------------------
+
+test('send skips a channel whose buffer is over its cap', async () => {
+  const env = fakeEnv(), h = await hostWithGuest(env);
+  env.pcs[0].open();
+  const peer = h.room.peers.get('G'), [stateCh, eventsCh] = env.pcs[0].channels;
+  stateCh.bufferedAmount = 256 * 1024;
+  assert.equal(peer.send(new Uint8Array([1])), false);
+  eventsCh.bufferedAmount = 4 * 1024 * 1024;
+  assert.equal(peer.send({ a: 1 }, { reliable: true }), false);
+  assert.deepEqual([stateCh.sent, eventsCh.sent], [[], []]);
+  stateCh.bufferedAmount = 0;
+  assert.equal(peer.send(new Uint8Array([1])), true);
+  h.hs.close();
+});
+
+// ---- errors go to the request they answer (C-5) -------------------------------
+
+test('an error for another request does not fail a pending resume', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await guesting(env);
+  const closed = record(room, ['closed']);
+  ws.drop();
+  const ws2 = await until(() => env.sockets[1]);
+  await ws2.next('resume');
+  ws2.push({ t: 'error', code: 'peer_unavailable', message: 'that peer is not connected', re: 'signal' });
+  ws2.push({ t: 'error', code: 'not_in_room', message: 'join a room first' }); // an older server sends no re
+  ws2.push({ t: 'joined', resumed: true, room: guestView({ resume: 'rG2' }) });
+  ws2.drop();
+  const ws3 = await until(() => env.sockets[2]);
+  assert.equal((await ws3.next('resume')).token, 'rG2'); // the first resume worked
+  assert.deepEqual(closed, []);
+  hs.close();
+});
+
+test('an error with re rejects the request of that type, not the first one', async () => {
+  const env = fakeEnv(), { hs, ws, room } = await hosting(env);
+  const meta = room.setMeta({ a: 1 }), kick = room.kick('X');
+  await ws.next('kick');
+  ws.push({ t: 'error', code: 'peer_unavailable', message: 'no such peer', re: 'kick' });
+  await assert.rejects(kick, { code: 'peer_unavailable' });
+  ws.push({ t: 'room_meta', meta: { a: 1 }, locked: false });
+  await meta;
+  hs.close();
+});
+
+// ---- no silent failures -------------------------------------------------------
+
+test('a candidate that cannot be added is warned about once', async t => {
+  const warn = t.mock.method(console, 'warn', () => {});
+  const env = fakeEnv(), h = await hostWithGuest(env);
+  h.ws.push({ t: 'signal', from: 'G', data: { sdp: { type: 'answer', sdp: 'answer' } } });
+  h.ws.push({ t: 'signal', from: 'G', data: { candidate: { bad: 1 } } });
+  h.ws.push({ t: 'signal', from: 'G', data: { candidate: { bad: 2 } } });
+  h.ws.push({ t: 'signal', from: 'G', data: { candidate: { candidate: 'ok' } } });
+  await until(() => env.pcs[0].candidates.length === 1);
+  assert.equal(warn.mock.calls.filter(c => c.arguments.some(a => String(a).includes('candidate'))).length, 1);
+  h.hs.close();
+});
+
+test('a guest with no connection asks again when the host comes back (its first ask found the host away)', async () => {
+  const env = fakeEnv(), { hs, ws } = await guesting(env);
+  ws.push({ t: 'signal', from: 'H', data: { sdp: { type: 'offer', sdp: 'offer1' }, new: true } });
+  await ws.next('signal');
+  env.pcs[0].remoteChannels(); env.pcs[0].channels.forEach(c => c.open());
+  ws.push({ t: 'host_away', grace_secs: 30 });
+  env.pcs[0].channels[0].close();
+  assert.deepEqual((await ws.next('signal')).data, { restart: true, rebuild: true });
+  ws.push({ t: 'error', code: 'peer_unavailable', message: 'that peer is not connected', re: 'signal' });
+  ws.push({ t: 'host_back' });
+  assert.deepEqual((await ws.next('signal')).data, { restart: true, rebuild: true });
+  hs.close();
 });

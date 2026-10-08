@@ -48,7 +48,7 @@ Credentials follow coturn's `use-auth-secret` (TURN REST API) scheme:
 
 coturn checks them on its own; there is no call back to Handshake. Because the app ID is in the username, coturn's logs attribute relay usage per app, and its quotas (`user-quota`, `total-quota`, `max-bps`) can limit it.
 
-The JS client fetches credentials from `POST /turn` before creating or joining a room, renews them about a minute before they expire, and pushes the new ones into open peer connections. If the fetch fails, it logs a warning and carries on without TURN. See the [HTTP API](/reference/http/).
+The JS client fetches credentials from `POST /turn` before creating or joining a room, renews them about a minute before they expire, and pushes the new ones into open peer connections. A failed fetch is tried once more. If it fails again, the client logs a warning and carries on without TURN, except with `relayUnlessNearby` (below): then `createRoom` and `joinRoom` reject with `no_turn`, since players who are not nearby could never connect. See the [HTTP API](/reference/http/).
 
 ## Nearby players
 
@@ -68,7 +68,7 @@ With this option the client connects to any player who is **not** nearby only th
 
 Two consequences:
 
-- Every non-nearby connection is relayed, so it costs TURN bandwidth and needs TURN to work. If TURN is not configured, those players cannot connect at all.
+- Every non-nearby connection is relayed, so it costs TURN bandwidth and needs TURN to work. Without TURN credentials (the app has `turn = false`, or `/turn` failed twice), `createRoom` and `joinRoom` reject with `HandshakeError` code `no_turn` instead of opening a room nobody far away can connect to. Show the player a message and let them try again.
 - "Same public IP" is a network fact, not an identity check. Players behind the same carrier NAT can share a public IP and count as nearby.
 
 ## Network changes and ICE restart
@@ -79,6 +79,13 @@ When a phone switches between Wi-Fi and cellular, its peer connections break. Th
 - for every peer connection when the browser fires `online`.
 
 The host makes a new offer with an ICE restart; a guest asks the host to. The new offer and candidates go over the signaling socket, which stays open for the whole session for exactly this reason. If the socket is down too, the messages wait until the client has resumed (see [Rooms](/guides/rooms/#lifecycle-and-resume)).
+
+When an ICE restart is too late and a data channel closes (an iPad in the background for half a minute, say), the peer connection is gone: its `close` event fires and it leaves `room.peers`. A channel that closes before both channels opened counts too. The client then builds a new connection by itself:
+
+- The host makes a new one to that guest at once, or when the guest comes back (`peerBack`) if its socket is down. A guest whose connections keep failing waits longer between tries (2, 5, then 15 seconds), until one opens.
+- A guest asks the host for a new one (`{restart: true, rebuild: true}` in a signal), queued until its socket has resumed, and asks again when the host comes back (`hostBack`) if it still has none.
+
+The first offer of every connection is marked `new: true`, so a guest that still holds an old connection replaces it. The new connection arrives as another `peer` event with the same peer id.
 
 ## Connection type badge
 

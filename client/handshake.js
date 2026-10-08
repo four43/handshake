@@ -33,6 +33,10 @@ const HEARTBEAT_MS = 25_000;      // a `list` round trip proves the socket lives
 const RESUME_BACKOFF_MS = [250, 1_000, 2_000, 4_000, 8_000];
 const REFRESH_EARLY_MS = 60_000;  // renew a session token or TURN credential this long before it expires
 const STATS_MS = 5_000;           // connection type check while a peer is open
+const REBUILD_MS = [0, 2_000, 5_000, 15_000]; // host: wait before each new connection to a guest whose last one closed
+const MAX_BUFFERED = { state: 64 * 1024, events: 1024 * 1024 }; // bytes queued on a channel before `send` skips
+// Without `re` (an older server), these errors can only answer these requests, never a create, join, peek or resume.
+const ERROR_REQUESTS = { peer_unavailable: ['kick'], not_in_room: ['lock', 'meta', 'kick', 'leave'], not_host: ['lock', 'meta', 'kick'] };
 
 export class HandshakeError extends Error {
   /** @param {string} code a server error code, or 'network', 'timeout' or 'closed' @param {string} [message] */
@@ -63,6 +67,11 @@ class Emitter {
 }
 
 const parse = text => { try { return JSON.parse(text); } catch { return null; } };
+const warned = new Set();
+/** console.warn once per `kind`: a failure that repeats (every candidate, every heartbeat) is logged, never a flood. */
+const warnOnce = (kind, ...args) => { if (warned.has(kind)) return; warned.add(kind); console.warn('handshake:', kind, ...args); };
+/** True when at least one ICE server is a TURN relay (a turn: or turns: URL); STUN alone cannot carry a relay-only connection. */
+const hasRelay = servers => (servers ?? []).some(s => [].concat(s?.urls ?? []).some(u => /^turns?:/i.test(String(u))));
 const member = p => ({ id: p.id, name: p.name ?? '', nearby: !!p.nearby, away: !!p.away });
 
 /**
@@ -126,9 +135,11 @@ export function connectionType(stats) {
  * The client: one per player. It fetches session tokens and TURN credentials, keeps the signaling socket open,
  * resumes after drops and sets up a WebRTC connection to each peer.
  *
- * Every promise rejects with a {@link HandshakeError}. Its `code` is a server error code or `network`, `timeout`
- * or `closed`. Any call can fail with `network`, `timeout`, `closed`, `rate_limited`, `origin` (the page's origin is
- * not allowed for the app) or `not_found` (unknown app id).
+ * Every promise rejects with a {@link HandshakeError}. Its `code` is a server error code or `network`, `timeout`,
+ * `closed` or `no_turn`. Any call can fail with `network`, `timeout`, `closed`, `rate_limited`, `origin` (the page's
+ * origin is not allowed for the app) or `not_found` (unknown app id). With `relayUnlessNearby`, `joinRoom` fails with
+ * `no_turn` for a guest that is not on the host's network when no TURN relay is to be had (the server offers none,
+ * `/turn` failed twice, or its ICE servers have no turn: URL). Hosting, and guests on the host's network, need none.
  */
 export class Handshake {
   #o; #token = null; #tokenUntil = 0; #turn = false; #ice = []; #iceUntil = 0;
@@ -187,7 +198,7 @@ export class Handshake {
    */
   async createRoom({ public: pub = false, maxPlayers, meta, name } = {}) {
     if (this.#room) throw new HandshakeError('already_in_room');
-    await this.#iceServers();
+    await this.#iceServers(); // a host needs no relay itself: a guest that is not nearby checks for one when it joins
     const m = await this.#request({ t: 'create', public: pub, name, player: this.#o.name, max_players: maxPlayers, meta }, 'joined');
     return this.#enter(m.room);
   }
@@ -197,13 +208,20 @@ export class Handshake {
    * @param {string} code the join code (case-insensitive) @param {string} [key] needed for a private room
    * @returns {Promise<Room>}
    * @throws {HandshakeError} `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `already_in_room`,
-   *   `rate_limited`
+   *   `rate_limited`, `no_turn`
    */
   async joinRoom(code, key) {
     if (this.#room) throw new HandshakeError('already_in_room');
     await this.#iceServers();
     const m = await this.#request({ t: 'join', code: String(code).trim().toUpperCase(), key, player: this.#o.name }, 'joined');
-    return this.#enter(m.room, key);
+    const room = this.#enter(m.room, key);
+    // relayUnlessNearby: a guest that is not on the host's network connects only through a TURN relay. With no relay
+    // (the server offers none, /turn failed twice, or it lists only STUN) that connection can never be made: say so now.
+    if (this.#o.relayUnlessNearby && !room.members.find(x => x.id === room.you)?.nearby && !(hasRelay(this.#ice) && Date.now() < this.#iceUntil)) {
+      room.leave();
+      throw new HandshakeError('no_turn', this.#turn ? 'not on the host\'s network, and the server gave no TURN relay (no turn: URL, or /turn failed)' : 'not on the host\'s network, and the server offers no TURN relay for this app');
+    }
+    return room;
   }
 
   /**
@@ -244,7 +262,7 @@ export class Handshake {
         body: body ? JSON.stringify(body) : undefined,
       });
     } catch (e) { throw new HandshakeError('network', String(e?.message ?? e)); }
-    const data = await res.json().catch(() => ({}));
+    const data = await res.json().catch(e => { warnOnce(`${path} reply is not JSON`, e); return {}; });
     if (!res.ok) throw new HandshakeError(data.error ?? 'network', `HTTP ${res.status}`);
     return data;
   }
@@ -258,17 +276,29 @@ export class Handshake {
     return this.#token;
   }
 
-  /** TURN credentials, renewed before they expire (and pushed into open peer connections). */
+  /**
+   * TURN credentials, renewed before they expire (and pushed into open peer connections). A failed fetch is tried
+   * once more. Never throws: when there are none, the client goes on with what it has (direct connections only, or the old credentials until they expire).
+   */
   async #iceServers() {
     await this.#session();
-    if (!this.#turn || Date.now() < this.#iceUntil - REFRESH_EARLY_MS) return this.#ice;
-    try {
-      const t = await this.#post('/turn', null, this.#token);
-      this.#ice = t.ice_servers;
-      this.#iceUntil = Date.now() + t.ttl * 1000;
-      for (const peer of this.#room?.peers.values() ?? []) peer._setIce(this.#ice);
-    } catch (e) { console.warn('handshake: no TURN credentials', e); }
-    return this.#ice;
+    if (!this.#turn) {
+      return this.#ice;
+    }
+    if (Date.now() < this.#iceUntil - REFRESH_EARLY_MS) return this.#ice;
+    let error = null;
+    for (let i = 0; i < 2; i++) {
+      try {
+        const t = await this.#post('/turn', null, this.#token);
+        this.#ice = t.ice_servers;
+        this.#iceUntil = Date.now() + t.ttl * 1000;
+        for (const peer of this.#room?.peers.values() ?? []) peer._setIce(this.#ice);
+        return this.#ice;
+      } catch (e) { error = e; }
+    }
+    const current = Date.now() < this.#iceUntil;
+    warnOnce('no TURN credentials', error);
+    return current ? this.#ice : [];
   }
 
   // ---- socket -------------------------------------------------------------
@@ -331,7 +361,7 @@ export class Handshake {
     if (this.#closed) throw new HandshakeError('closed');
     if (connect) await this.#connect();
     return new Promise((resolve, reject) => {
-      const w = { want, errors, match, pass, room, resolve, reject };
+      const w = { re: msg.t, want, errors, match, pass, room, resolve, reject };
       w.timer = setTimeout(() => { this.#drop(w); reject(new HandshakeError('timeout', `no ${want} reply`)); }, REQUEST_MS);
       this.#waiters.push(w);
       if (!this.#send(msg)) { this.#drop(w); reject(new HandshakeError('network', 'socket is not open')); }
@@ -350,9 +380,10 @@ export class Handshake {
     if (!m) return;
     if (m.t === 'error') {
       if (m.code === 'replaced') return this.#exit('replaced');
-      const w = this.#waiters.find(x => x.errors);
+      // `re` names the request this error answers; an older server sends none (see ERROR_REQUESTS)
+      const w = this.#waiters.find(x => x.errors && (m.re ? x.re === m.re : !ERROR_REQUESTS[m.code] || ERROR_REQUESTS[m.code].includes(x.re)));
       if (w) { this.#drop(w); w.reject(new HandshakeError(m.code, m.message)); }
-      else console.warn('handshake:', m.code, m.message);
+      else warnOnce(`server error ${m.code}${m.re ? ` (${m.re})` : ''}`, m.message); // e.g. ICE candidates to a peer who is away
       return;
     }
     const w = this.#waiters.find(x => x.want === m.t && (!x.match || x.match(m)));
@@ -383,12 +414,13 @@ export class Handshake {
   #beatOnce() {
     const ws = this.#ws;
     if (!ws) return;
-    this.#request({ t: 'list' }, 'rooms', { errors: false }).catch(() => {
+    this.#request({ t: 'list' }, 'rooms', { errors: false }).catch(e => {
       if (ws !== this.#ws) return;
+      warnOnce('heartbeat failed, resuming', e);
       try { ws.close(); } catch { /* already closing */ }
       this.#onClose(ws); // do not wait for a close handshake on a dead socket
     });
-    if (this.#room) this.#iceServers().catch(() => {});
+    if (this.#room) this.#iceServers().catch(e => warnOnce('TURN refresh failed', e));
   }
 
   // ---- room lifecycle -----------------------------------------------------
@@ -495,7 +527,7 @@ export class Handshake {
  * @hideconstructor
  */
 class Room extends Emitter {
-  #link;
+  #link; #rebuilds = new Map(); // host: guest id -> { n: new connections since one last opened, timer }
 
   constructor(link, r, key) {
     super();
@@ -549,15 +581,27 @@ class Room extends Emitter {
         if (this.isHost) this.#addPeer(m.peer, true);
         break;
       case 'peer_away': this.#setAway(m.peer, true); this.emit('peerAway', m.peer); this.emit('members', this.members); break;
-      case 'peer_back': this.#setAway(m.peer, false); this.emit('peerBack', m.peer); this.emit('members', this.members); break;
+      case 'peer_back':
+        this.#setAway(m.peer, false);
+        if (this.isHost && !this.peers.has(m.peer)) this.#rebuild(m.peer); // its connection closed while it was away
+        this.emit('peerBack', m.peer);
+        this.emit('members', this.members);
+        break;
       case 'peer_left':
         this.members = this.members.filter(x => x.id !== m.peer);
+        clearTimeout(this.#rebuilds.get(m.peer)?.timer);
+        this.#rebuilds.delete(m.peer);
         this.peers.get(m.peer)?._close();
         this.emit('peerLeft', m.peer, m.reason);
         this.emit('members', this.members);
         break;
       case 'host_away': this.#setAway(this.hostId, true); this.emit('hostAway', m.grace_secs); this.emit('members', this.members); break;
-      case 'host_back': this.#setAway(this.hostId, false); this.emit('hostBack'); this.emit('members', this.members); break;
+      case 'host_back':
+        this.#setAway(this.hostId, false);
+        if (!this.isHost && !this.peers.has(this.hostId)) this.#lost(this.hostId); // an ask while the host was away found nobody
+        this.emit('hostBack');
+        this.emit('members', this.members);
+        break;
       case 'room_meta':
         this.locked = !!m.locked;
         this.meta = m.meta ?? null;
@@ -589,6 +633,7 @@ class Room extends Emitter {
   _close(reason) {
     if (this.closed) return;
     this.closed = true;
+    for (const r of this.#rebuilds.values()) clearTimeout(r.timer);
     for (const peer of [...this.peers.values()]) peer._close();
     this.emit('closed', reason);
   }
@@ -599,15 +644,57 @@ class Room extends Emitter {
     // Relay policy uses the guest's flag: the host's view of the guest, or the guest's own entry.
     const nearby = !!this.members.find(x => x.id === (initiator ? id : this.you))?.nearby;
     const peer = new Peer(this.#link, id, this.members.find(x => x.id === id)?.name ?? '', nearby, initiator,
-      () => this.emit('peer', peer),
-      () => { if (this.peers.get(id) === peer) this.peers.delete(id); });
+      () => { this.#rebuilds.delete(id); this.emit('peer', peer); },
+      failed => {
+        if (this.peers.get(id) !== peer) return;
+        this.peers.delete(id);
+        if (failed) this.#lost(id);
+      });
     this.peers.set(id, peer);
     return peer;
   }
 
+  /** A connection closed by itself (ICE failed, a channel closed): the host makes a new one, a guest asks it to. */
+  #lost(id) {
+    if (this.closed) return;
+    if (this.isHost) this.#rebuild(id);
+    else this.#link.signal(this.hostId, { restart: true, rebuild: true }); // queued while the socket is down
+  }
+
+  /**
+   * Host: a new connection to guest `id`, once it is here (not away, or `here`: it just signaled) and has none;
+   * later tries wait longer.
+   */
+  #rebuild(id, here = false) {
+    const r = this.#rebuilds.get(id) ?? { n: 0, timer: null };
+    this.#rebuilds.set(id, r);
+    if (r.timer !== null) return;
+    const go = () => {
+      r.timer = null;
+      if (this.closed || this.peers.has(id) || !this.members.find(x => x.id === id && (here || !x.away))) return;
+      r.n++;
+      this.#addPeer(id, true);
+    };
+    const delay = REBUILD_MS[Math.min(r.n, REBUILD_MS.length - 1)];
+    if (delay) r.timer = setTimeout(go, delay); else go();
+  }
+
   #onSignal(from, data) {
     let peer = this.peers.get(from);
-    if (!peer && !this.isHost && from === this.hostId) peer = this.#addPeer(from, false);
+    if (this.isHost) {
+      if (data?.restart && this.members.some(x => x.id === from)) {
+        // No connection here, or the guest lost its side: a new connection. A new one not yet answered is on its way.
+        if (!peer) return this.#rebuild(from, true);
+        if (data.rebuild) {
+          if (!peer._started) return;
+          peer._close();
+          return this.#rebuild(from, true);
+        }
+      }
+    } else if (from === this.hostId) {
+      if (peer && data?.new && data.sdp && peer._started) { peer._close(); peer = null; } // the host made a new connection
+      if (!peer) peer = this.#addPeer(from, false);
+    }
     peer?._signal(data);
   }
 }
@@ -657,13 +744,15 @@ class Peer extends Emitter {
    * Binary (ArrayBuffer or typed array) goes on either channel; a plain object only on the reliable one, as JSON.
    * @param {ArrayBuffer | ArrayBufferView | object} data
    * @param {{ reliable?: boolean }} [o]
-   * @returns {boolean} false when the channel is not open (nothing was sent)
+   * @returns {boolean} false when the channel is not open, or holds more than 64 KB (`state`) or 1 MB (`events`)
+   *   not yet sent: nothing was sent
    */
   send(data, { reliable = false } = {}) {
     const ch = reliable ? this.#events : this.#state;
     const binary = data instanceof ArrayBuffer || ArrayBuffer.isView(data);
     if (!binary && !reliable) throw new TypeError('handshake: only binary data can go on the unreliable channel');
     if (!this.open || ch?.readyState !== 'open') return false;
+    if (ch.bufferedAmount > MAX_BUFFERED[ch.label]) { warnOnce(`${ch.label} channel is full: sends skipped`); return false; }
     ch.send(binary ? data : JSON.stringify(data));
     return true;
   }
@@ -686,23 +775,27 @@ class Peer extends Emitter {
     catch (e) { console.warn('handshake setConfiguration', e); }
   }
 
-  /** @internal */
-  _close() {
+  /** @internal the other side's description has arrived (the guest's answer, or the host's offer) */
+  get _started() { return !!this.#pc.remoteDescription; }
+
+  /** @internal `failed`: it closed by itself (not left, kicked or replaced), so the room makes a new one */
+  _close(failed = false) {
     if (this.#gone === null) return;
     const gone = this.#gone;
     this.#gone = null;
     this.open = false;
     clearInterval(this.#stats);
     try { this.#pc.close(); } catch { /* already closed */ }
-    gone();
+    gone(failed);
     this.emit('close');
   }
 
+  /** The first offer of a connection is marked `new`, so a guest that still has an old one replaces it. */
   async #offer(iceRestart) {
     try {
       const pc = this.#pc;
       await pc.setLocalDescription(await pc.createOffer(iceRestart ? { iceRestart: true } : undefined));
-      this.#link.signal(this.id, { sdp: pc.localDescription });
+      this.#link.signal(this.id, iceRestart ? { sdp: pc.localDescription } : { sdp: pc.localDescription, new: true });
     } catch (e) { console.warn('handshake offer', e); }
   }
 
@@ -711,13 +804,13 @@ class Peer extends Emitter {
     if (this.#gone === null || !data) return;
     if (data.sdp) {
       await pc.setRemoteDescription(data.sdp);
-      for (const c of this.#pending.splice(0)) await pc.addIceCandidate(c).catch(() => {});
+      for (const c of this.#pending.splice(0)) await pc.addIceCandidate(c).catch(e => warnOnce('ICE candidate rejected', e));
       if (data.sdp.type === 'offer') {
         await pc.setLocalDescription(await pc.createAnswer());
         this.#link.signal(this.id, { sdp: pc.localDescription });
       }
     } else if (data.candidate) {
-      if (pc.remoteDescription) await pc.addIceCandidate(data.candidate).catch(() => {});
+      if (pc.remoteDescription) await pc.addIceCandidate(data.candidate).catch(e => warnOnce('ICE candidate rejected', e));
       else this.#pending.push(data.candidate); // before the offer/answer: hold it
     } else if (data.restart && this.#initiator) {
       await this.#offer(true);
@@ -731,7 +824,7 @@ class Peer extends Emitter {
     else return;
     ch.binaryType = 'arraybuffer';
     ch.onopen = () => this.#checkOpen();
-    ch.onclose = () => { if (this.open) this._close(); };
+    ch.onclose = () => this._close(true); // also before both opened: that connection failed
     ch.onmessage = e => {
       let data = e.data;
       if (typeof data === 'string') {

@@ -118,7 +118,7 @@ A room is one host plus its joined peers, namespaced by app and pinned to a game
 
 ### Public listing
 
-`list` returns the app's public rooms for the caller's version that are unlocked and not full, capped at 50. Each entry has `nearby: true` when the host's public IP matches the caller's (IPv4 exact, IPv6 by /64 prefix). Rooms whose host is away are left out. Nearby rooms sort first, then newest. Room names are capped at 32 characters.
+`list` returns the app's public rooms for the caller's version that are unlocked and not full, capped at 50. Each entry has `nearby: true` when the host's address matches the caller's: IPv4 exact, IPv6 by /64 prefix, and a private IPv4 address (10/8, 172.16/12, 192.168/16) by its /24, so devices on one home network are nearby when the server is on that network too (split DNS). Carrier NAT (100.64/10) stays exact. Rate limits still count each address on its own. Rooms whose host is away are left out. Nearby rooms sort first, then newest. Room names are capped at 32 characters.
 
 ### Host controls
 
@@ -199,13 +199,13 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `room_meta` | `meta`, `locked` | host changed meta or lock |
 | `room_closed` | `reason` | room ended |
 | `kicked` |  | you were kicked |
-| `error` | `code`, `message` | a request failed |
+| `error` | `code`, `message`, `re` | a request failed; `re` is that request's `t` (absent when the message was not JSON) |
 
 The `room` object in `joined` holds `code`, `name`, `public`, `max_players`, `locked`, `meta`, `host` (peer ID), `you` (your peer ID), `is_host`, `peers: [{id, name, away, nearby}]`, `resume`, and `key` (host only).
 
 Error codes: `bad_message`, `bad_token`, `origin`, `rate_limited`, `already_in_room`, `not_in_room`, `not_host`, `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `too_many_rooms`, `public_disabled`, `peer_unavailable`, `meta_too_large`.
 
-`nearby` on a peer is true when that peer's public IP matches the host's (same rule as Public listing); the host's own entry is always `true`. Games use it to force relayed connections between players who are not nearby, so neither learns the other's IP.
+`nearby` on a peer is true when that peer's address matches the host's (same rule as Public listing); the host's own entry is always `true`. Games use it to force relayed connections between players who are not nearby, so neither learns the other's IP.
 
 `replaced` is sent to an old socket as `{t: "error", code: "replaced"}` when the same session resumes on a new one; the old socket stays open but is no longer in the room. When the host sends `leave`, it also receives `room_closed`. A peer that resumes while its old socket is still open causes `peer_back` without an earlier `peer_away`. HTTP endpoints return `{error}` with `rate_limited`, `not_found`, `origin`, `bad_token`, `turn_disabled` or `turn_unconfigured`.
 
@@ -301,9 +301,12 @@ The library owns everything every game would otherwise repeat:
 - WebSocket connect, `hello`, heartbeat and automatic `resume` after drops
 - `RTCPeerConnection` setup, both data channels, offer/answer and ICE exchange
 - ICE restart on network change, `visibilitychange` handling, Wake Lock request
+- a new peer connection when one closes by itself (the host offers again, marked `new`; a guest asks with `{restart: true, rebuild: true}`), backing off while it keeps failing
+- a send skipped (returns false) while a channel holds more than 64 KB (`state`) or 1 MB (`events`) not yet sent
 - connection-type detection through `getStats()`
 - host controls (`lock`, `setMeta`, `kick`) that return promises settling on the server's answer
-- relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`
+- relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`; a guest that is not nearby and has no TURN relay (none offered, `/turn` failed twice, or its ICE servers have no `turn:`/`turns:` URL) fails `joinRoom` with `no_turn` (and leaves the room) instead of waiting for a connection that cannot come; hosting and nearby guests need no relay
+- server errors matched to the request they answer by `re`
 
 Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass through untouched on either channel.
 
@@ -323,7 +326,8 @@ Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass thr
 | Host-alone timeout | 30 min | `limits.idle_room_secs` |
 | Session mints per IP | 30 / min | `limits.sessions_per_min` |
 | Join attempts per IP | 20 / min | `limits.joins_per_min` |
-| Failed joins and peeks per app (all IPs) | 200 / min | `limits.app_failed_joins_per_min` |
+| Failed joins and peeks per IP (IPv6: per /64), per app | 10 / min | `limits.ip_failed_joins_per_min` |
+| Failed joins and peeks per app (all IPs) | 2000 / min | `limits.app_failed_joins_per_min` |
 | Expiry sweep (grace, idle, age) | every 5 s | fixed |
 | Room meta size | 1 KB | fixed |
 

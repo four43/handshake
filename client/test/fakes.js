@@ -25,7 +25,7 @@ export function statsFor(localType, remoteType = 'host') {
 }
 
 class FakeChannel {
-  constructor(label, opts) { this.label = label; this.opts = opts; this.readyState = 'connecting'; this.binaryType = 'blob'; this.sent = []; }
+  constructor(label, opts) { this.label = label; this.opts = opts; this.readyState = 'connecting'; this.binaryType = 'blob'; this.sent = []; this.bufferedAmount = 0; }
   send(data) { this.sent.push(data); }
   close() { this.readyState = 'closed'; this.onclose?.(); }
   // test helpers
@@ -36,7 +36,7 @@ class FakeChannel {
 export function fakeEnv({ turn = true } = {}) {
   const env = {
     sockets: [], pcs: [], posts: [], sessionCount: 0,
-    turn, expiresIn: 900, failFetch: false, sessionError: null, autoWelcome: true,
+    turn, expiresIn: 900, failFetch: false, sessionError: null, autoWelcome: true, turnFailures: 0,
   };
 
   env.fetch = async (url, init) => {
@@ -48,7 +48,8 @@ export function fakeEnv({ turn = true } = {}) {
       env.sessionCount++;
       return json(200, { token: `tok${env.sessionCount}`, expires_in: env.expiresIn, turn: env.turn });
     }
-    if (path === '/turn') return json(200, { ice_servers: [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }], ttl: 3600 });
+    if (path === '/turn' && env.turnFailures > 0) { env.turnFailures--; return json(503, {}); }
+    if (path === '/turn') return json(200, { ice_servers: env.iceServers ?? [{ urls: ['turn:turn.test:3478'], username: 'u', credential: 'c' }], ttl: 3600 });
     return json(404, { error: 'not_found' });
   };
 
@@ -95,7 +96,7 @@ export function fakeEnv({ turn = true } = {}) {
     async createAnswer() { return { type: 'answer', sdp: 'answer' }; }
     async setLocalDescription(d) { this.localDescription = d; }
     async setRemoteDescription(d) { this.remoteDescription = d; }
-    async addIceCandidate(c) { this.candidates.push(c); }
+    async addIceCandidate(c) { if (c?.bad) throw new Error('bad candidate'); this.candidates.push(c); }
     async getStats() { return this.stats; }
     getConfiguration() { return this.config; }
     setConfiguration(c) { this.config = c; }

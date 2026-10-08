@@ -41,7 +41,7 @@ Generated from the `In` enum in `src/lib.rs`. Fields marked optional can be left
 | `room_meta` | `meta`, `locked` | the host changed meta or lock |
 | `room_closed` | `reason` | the room ended: `host_left`, `host_gone`, `expired` or `idle` |
 | `kicked` | | you were kicked |
-| `error` | `code`, `message` | a request failed |
+| `error` | `code`, `message`, `re` | a request failed; `re` is that request's `t` (absent when the message was not JSON) |
 
 ### The `room` object
 
@@ -69,5 +69,7 @@ Generated from the `In` enum in `src/lib.rs`. Fields marked optional can be left
 `error.code` is one of:
 
 `bad_message`, `bad_token`, `origin`, `rate_limited`, `already_in_room`, `not_in_room`, `not_host`, `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `too_many_rooms`, `public_disabled`, `peer_unavailable`, `meta_too_large`.
+
+An error that answers a request carries `re`, the `t` of that request (`"join"`, `"signal"`, ...), so a client with several requests in flight can tell which one failed: an error for an ICE candidate sent to a peer who is away (`re: "signal"`) is not the answer to a `resume`. The server answers each socket's requests in order.
 
 When the same session resumes on a new socket, the old one gets `{"t": "error", "code": "replaced"}`. It stays open but is no longer in the room.
