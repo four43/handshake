@@ -1,4 +1,10 @@
+<p align="center">
+  <a href="https://four43.github.io/handshake/"><img src="docs/banner.png" alt="Handshake: WebRTC signaling and rooms for browser games" width="100%"></a>
+</p>
+
 # Handshake
+
+**[Docs](https://four43.github.io/handshake/)** · [Quickstart](https://four43.github.io/handshake/quickstart/) · [JS client API](https://four43.github.io/handshake/reference/client/) · [Protocol](https://four43.github.io/handshake/reference/protocol/)
 
 A small WebRTC signaling server and room registry for four43.com browser games, plus the browser
 client every game uses (`client/handshake.js`). It matches players into rooms and relays connection
@@ -23,6 +29,7 @@ Rust types (`schemars`, test builds only). `cargo test` fails when they are stal
 
 ```bash
 cd site && npm install && npm run dev           # http://localhost:4321/handshake/
+cd site && npm run images                        # redraw site/public/og.png and docs/banner.png
 UPDATE_SCHEMAS=1 scripts/test.sh schemas_are_current   # after changing Config or the In enum
 ```
 

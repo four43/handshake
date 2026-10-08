@@ -34,6 +34,15 @@ export default defineConfig({
       // Point agents that read the HTML at the plain-text docs.
       head: [
         { tag: 'link', attrs: { rel: 'alternate', type: 'text/plain', title: 'llms.txt', href: `${base.replace(/\/$/, '')}/llms.txt` } },
+        // Link previews: public/og.png, drawn by `npm run images`.
+        ...[
+          ['property', 'og:image', `${site}${base.replace(/\/$/, '')}/og.png`],
+          ['property', 'og:image:width', '1200'],
+          ['property', 'og:image:height', '630'],
+          ['property', 'og:image:alt', 'Handshake: get players connected, then get out of the way'],
+          ['name', 'twitter:card', 'summary_large_image'],
+          ['name', 'twitter:image', `${site}${base.replace(/\/$/, '')}/og.png`],
+        ].map(([key, name, content]) => ({ tag: 'meta', attrs: { [key]: name, content } })),
       ],
       expressiveCode: { themes: ['github-dark-default', 'github-light-default'] },
       plugins: [
