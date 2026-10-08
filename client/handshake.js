@@ -137,8 +137,9 @@ export function connectionType(stats) {
  *
  * Every promise rejects with a {@link HandshakeError}. Its `code` is a server error code or `network`, `timeout`,
  * `closed` or `no_turn`. Any call can fail with `network`, `timeout`, `closed`, `rate_limited`, `origin` (the page's
- * origin is not allowed for the app) or `not_found` (unknown app id). With `relayUnlessNearby`, `createRoom` and
- * `joinRoom` fail with `no_turn` when no TURN relay is to be had (the server offers none, or `/turn` failed twice).
+ * origin is not allowed for the app) or `not_found` (unknown app id). With `relayUnlessNearby`, `joinRoom` fails with
+ * `no_turn` for a guest that is not on the host's network when no TURN relay is to be had (the server offers none,
+ * `/turn` failed twice, or its ICE servers have no turn: URL). Hosting, and guests on the host's network, need none.
  */
 export class Handshake {
   #o; #token = null; #tokenUntil = 0; #turn = false; #ice = []; #iceUntil = 0;
@@ -193,11 +194,11 @@ export class Handshake {
    * @param {any} [o.meta] any JSON (at most 1 KB) the lobby shows, such as map or mode; the server never reads it
    * @param {string} [o.name] the room's name in listings (cut to 32 characters)
    * @returns {Promise<Room>}
-   * @throws {HandshakeError} `already_in_room`, `public_disabled`, `too_many_rooms`, `meta_too_large`, `no_turn`
+   * @throws {HandshakeError} `already_in_room`, `public_disabled`, `too_many_rooms`, `meta_too_large`
    */
   async createRoom({ public: pub = false, maxPlayers, meta, name } = {}) {
     if (this.#room) throw new HandshakeError('already_in_room');
-    await this.#iceServers({ needed: this.#o.relayUnlessNearby });
+    await this.#iceServers(); // a host needs no relay itself: a guest that is not nearby checks for one when it joins
     const m = await this.#request({ t: 'create', public: pub, name, player: this.#o.name, max_players: maxPlayers, meta }, 'joined');
     return this.#enter(m.room);
   }
@@ -211,9 +212,16 @@ export class Handshake {
    */
   async joinRoom(code, key) {
     if (this.#room) throw new HandshakeError('already_in_room');
-    await this.#iceServers({ needed: this.#o.relayUnlessNearby });
+    await this.#iceServers();
     const m = await this.#request({ t: 'join', code: String(code).trim().toUpperCase(), key, player: this.#o.name }, 'joined');
-    return this.#enter(m.room, key);
+    const room = this.#enter(m.room, key);
+    // relayUnlessNearby: a guest that is not on the host's network connects only through a TURN relay. With no relay
+    // (the server offers none, /turn failed twice, or it lists only STUN) that connection can never be made: say so now.
+    if (this.#o.relayUnlessNearby && !room.members.find(x => x.id === room.you)?.nearby && !(hasRelay(this.#ice) && Date.now() < this.#iceUntil)) {
+      room.leave();
+      throw new HandshakeError('no_turn', this.#turn ? 'not on the host\'s network, and the server gave no TURN relay (no turn: URL, or /turn failed)' : 'not on the host\'s network, and the server offers no TURN relay for this app');
+    }
+    return room;
   }
 
   /**
@@ -270,13 +278,11 @@ export class Handshake {
 
   /**
    * TURN credentials, renewed before they expire (and pushed into open peer connections). A failed fetch is tried
-   * once more. When `needed` (relay-only connections) and there are still none, it throws `no_turn`; otherwise
-   * the client goes on with what it has (direct connections only, or the old credentials until they expire).
+   * once more. Never throws: when there are none, the client goes on with what it has (direct connections only, or the old credentials until they expire).
    */
-  async #iceServers({ needed = false } = {}) {
+  async #iceServers() {
     await this.#session();
     if (!this.#turn) {
-      if (needed) throw new HandshakeError('no_turn', 'the server offers no TURN relay for this app');
       return this.#ice;
     }
     if (Date.now() < this.#iceUntil - REFRESH_EARLY_MS) return this.#ice;
@@ -284,15 +290,13 @@ export class Handshake {
     for (let i = 0; i < 2; i++) {
       try {
         const t = await this.#post('/turn', null, this.#token);
-        if (needed && !hasRelay(t.ice_servers)) throw new HandshakeError('no_turn', 'the server\'s ICE servers have no turn: URL (only STUN), so a relay-only connection can never be made');
         this.#ice = t.ice_servers;
         this.#iceUntil = Date.now() + t.ttl * 1000;
         for (const peer of this.#room?.peers.values() ?? []) peer._setIce(this.#ice);
         return this.#ice;
-      } catch (e) { if (e?.code === 'no_turn') throw e; error = e; }
+      } catch (e) { error = e; }
     }
     const current = Date.now() < this.#iceUntil;
-    if (needed && !current) throw new HandshakeError('no_turn', `no TURN credentials: ${error.message}`);
     warnOnce('no TURN credentials', error);
     return current ? this.#ice : [];
   }
