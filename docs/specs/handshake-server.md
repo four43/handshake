@@ -199,7 +199,7 @@ Three HTTP endpoints plus one WebSocket carrying JSON messages tagged by a `t` f
 | `room_meta` | `meta`, `locked` | host changed meta or lock |
 | `room_closed` | `reason` | room ended |
 | `kicked` |  | you were kicked |
-| `error` | `code`, `message` | a request failed |
+| `error` | `code`, `message`, `re` | a request failed; `re` is that request's `t` (absent when the message was not JSON) |
 
 The `room` object in `joined` holds `code`, `name`, `public`, `max_players`, `locked`, `meta`, `host` (peer ID), `you` (your peer ID), `is_host`, `peers: [{id, name, away, nearby}]`, `resume`, and `key` (host only).
 
@@ -323,7 +323,8 @@ Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass thr
 | Host-alone timeout | 30 min | `limits.idle_room_secs` |
 | Session mints per IP | 30 / min | `limits.sessions_per_min` |
 | Join attempts per IP | 20 / min | `limits.joins_per_min` |
-| Failed joins and peeks per app (all IPs) | 200 / min | `limits.app_failed_joins_per_min` |
+| Failed joins and peeks per IP (IPv6: per /64), per app | 10 / min | `limits.ip_failed_joins_per_min` |
+| Failed joins and peeks per app (all IPs) | 2000 / min | `limits.app_failed_joins_per_min` |
 | Expiry sweep (grace, idle, age) | every 5 s | fixed |
 | Room meta size | 1 KB | fixed |
 

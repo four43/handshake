@@ -113,7 +113,10 @@ pub struct Limits {
     pub sessions_per_min: u32,
     /// Join and peek attempts per client IP per minute.
     pub joins_per_min: u32,
-    /// Failed joins and peeks (`not_found`, `bad_key`) per app per minute, across all IPs.
+    /// Failed joins and peeks (`not_found`, `bad_key`) per client IP (IPv6: per /64) per app per minute.
+    pub ip_failed_joins_per_min: u32,
+    /// Failed joins and peeks per app per minute, across all IPs: a ceiling against guessing from many addresses.
+    /// Keep it well above `ip_failed_joins_per_min`, so a few guessing IPs cannot lock out every join.
     pub app_failed_joins_per_min: u32,
 }
 
@@ -126,7 +129,8 @@ impl Default for Limits {
             idle_room_secs: 1800,
             sessions_per_min: 30,
             joins_per_min: 20,
-            app_failed_joins_per_min: 200,
+            ip_failed_joins_per_min: 10,
+            app_failed_joins_per_min: 2000,
         }
     }
 }
@@ -299,7 +303,7 @@ struct Metrics {
 }
 
 type RateMap = HashMap<(IpAddr, &'static str), (Instant, u32)>;
-type FailMap = HashMap<String, (Instant, u32)>; // app id -> (window start, failures)
+type FailMap = HashMap<String, (Instant, u32)>; // app id, or app id + IP group (fail_keys) -> (window start, failures)
 
 #[derive(Default)]
 struct Inner {
@@ -451,6 +455,25 @@ enum In {
 // Conns / Room helpers
 // ---------------------------------------------------------------------------
 
+impl In {
+    /// The message's `t`, echoed as `re` in an error that answers it.
+    fn kind(&self) -> &'static str {
+        match self {
+            In::Hello { .. } => "hello",
+            In::Create { .. } => "create",
+            In::Join { .. } => "join",
+            In::Resume { .. } => "resume",
+            In::Peek { .. } => "peek",
+            In::List => "list",
+            In::Signal { .. } => "signal",
+            In::Lock { .. } => "lock",
+            In::Meta { .. } => "meta",
+            In::Kick { .. } => "kick",
+            In::Leave => "leave",
+        }
+    }
+}
+
 impl Conns {
     fn send(&mut self, id: ConnId, msg: &Value) {
         if let Some(c) = self.map.get(&id) {
@@ -462,6 +485,12 @@ impl Conns {
 
     fn error(&mut self, id: ConnId, code: &str, message: &str) {
         self.send(id, &json!({ "t": "error", "code": code, "message": message }));
+    }
+
+    /// An error in answer to a request: `re` is that request's `t`, so a client with several requests in flight
+    /// can tell which one failed.
+    fn reply(&mut self, id: ConnId, re: &str, code: &str, message: &str) {
+        self.send(id, &json!({ "t": "error", "code": code, "message": message, "re": re }));
     }
 
     fn bind(&mut self, id: ConnId, code: &str, peer: &str) {
@@ -591,17 +620,18 @@ fn host_room<'r>(
     bound: &Option<(String, PeerId)>,
     conns: &mut Conns,
     conn: ConnId,
+    re: &str,
 ) -> Option<&'r mut Room> {
     let Some((code, me)) = bound else {
-        conns.error(conn, "not_in_room", "join a room first");
+        conns.reply(conn, re, "not_in_room", "join a room first");
         return None;
     };
     let Some(room) = app_rooms.get_mut(code) else {
-        conns.error(conn, "not_in_room", "room no longer exists");
+        conns.reply(conn, re, "not_in_room", "room no longer exists");
         return None;
     };
     if &room.host != me {
-        conns.error(conn, "not_host", "only the host can do that");
+        conns.reply(conn, re, "not_host", "only the host can do that");
         return None;
     }
     Some(room)
@@ -756,14 +786,14 @@ impl App {
     // ---- message handling ----------------------------------------------
 
     /// Checks shared by `join` and `peek`, in order: not already in a room,
-    /// the per-IP attempt budget, then the app's failed-attempt budget.
+    /// the per-IP attempt budget, then the IP's and the app's failed-attempt budgets.
     fn join_gate(
         &self,
         bound: &Option<(String, PeerId)>,
         rate: &mut RateMap,
         app_fails: &mut FailMap,
         ip: IpAddr,
-        app_id: &str,
+        fails: &[String; 2],
     ) -> Result<(), (&'static str, &'static str)> {
         if bound.is_some() {
             return Err(("already_in_room", "leave your current room first"));
@@ -771,13 +801,17 @@ impl App {
         if !rate_allow(rate, ip, "join", self.cfg.limits.joins_per_min) {
             return Err(("rate_limited", "too many join attempts; wait a minute"));
         }
-        if app_fails_over(app_fails, app_id, self.cfg.limits.app_failed_joins_per_min) {
+        if app_fails_over(app_fails, &fails[1], self.cfg.limits.ip_failed_joins_per_min) {
+            return Err(("rate_limited", "too many failed join attempts; wait a minute"));
+        }
+        if app_fails_over(app_fails, &fails[0], self.cfg.limits.app_failed_joins_per_min) {
             return Err(("rate_limited", "too many failed join attempts for this game; wait a minute"));
         }
         Ok(())
     }
 
     fn handle(&self, inner: &mut Inner, conn: ConnId, msg: In) {
+        let re = msg.kind();
         let Inner { conns, rooms, resume, rate, app_fails } = inner;
         let Some(c) = conns.map.get(&conn) else {
             return;
@@ -788,23 +822,24 @@ impl App {
             return;
         };
         let app_rooms = rooms.entry(app_id.clone()).or_default();
+        let fails = fail_keys(&app_id, &ip_group);
 
         match msg {
-            In::Hello { .. } => conns.error(conn, "bad_message", "already said hello"),
+            In::Hello { .. } => conns.reply(conn, re, "bad_message", "already said hello"),
 
             In::Create { public, name, player, max_players, meta } => {
                 if bound.is_some() {
-                    return conns.error(conn, "already_in_room", "leave your current room first");
+                    return conns.reply(conn, re, "already_in_room", "leave your current room first");
                 }
                 if public && !app.public_rooms {
-                    return conns.error(conn, "public_disabled", "public rooms are disabled for this app");
+                    return conns.reply(conn, re, "public_disabled", "public rooms are disabled for this app");
                 }
                 if app_rooms.len() >= app.max_rooms {
-                    return conns.error(conn, "too_many_rooms", "room limit reached for this app");
+                    return conns.reply(conn, re, "too_many_rooms", "room limit reached for this app");
                 }
                 let meta = meta.unwrap_or(Value::Null);
                 if meta.to_string().len() > MAX_META_BYTES {
-                    return conns.error(conn, "meta_too_large", "meta must be 1 KB or less");
+                    return conns.reply(conn, re, "meta_too_large", "meta must be 1 KB or less");
                 }
                 let code = loop {
                     let candidate = random_code();
@@ -847,21 +882,21 @@ impl App {
             In::Join { code, key, player } => {
                 let reject = |conns: &mut Conns, code: &str, message: &str| {
                     self.metrics.joins_rejected.fetch_add(1, Ordering::Relaxed);
-                    conns.error(conn, code, message);
+                    conns.reply(conn, re, code, message);
                 };
-                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &app_id) {
+                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &fails) {
                     return reject(conns, code, message);
                 }
                 let code = code.trim().to_ascii_uppercase();
                 let Some(room) = app_rooms.get_mut(&code) else {
-                    app_fail(app_fails, &app_id);
+                    app_fail(app_fails, &fails);
                     return reject(conns, "not_found", "no room with that code");
                 };
                 if room.version != version {
                     return reject(conns, "version_mismatch", "that room runs a different game version");
                 }
                 if !room.public && !key.as_deref().is_some_and(|k| ct_eq(k, &room.key)) {
-                    app_fail(app_fails, &app_id);
+                    app_fail(app_fails, &fails);
                     return reject(conns, "bad_key", "invalid room key");
                 }
                 if room.locked {
@@ -896,19 +931,19 @@ impl App {
 
             In::Resume { token } => {
                 if bound.is_some() {
-                    return conns.error(conn, "already_in_room", "leave your current room first");
+                    return conns.reply(conn, re, "already_in_room", "leave your current room first");
                 }
                 let Some((r_app, code, peer)) = resume.get(&token).cloned() else {
-                    return conns.error(conn, "not_found", "resume token expired");
+                    return conns.reply(conn, re, "not_found", "resume token expired");
                 };
                 if r_app != app_id {
-                    return conns.error(conn, "not_found", "resume token expired");
+                    return conns.reply(conn, re, "not_found", "resume token expired");
                 }
                 let Some(room) = app_rooms.get_mut(&code) else {
-                    return conns.error(conn, "not_found", "room no longer exists");
+                    return conns.reply(conn, re, "not_found", "room no longer exists");
                 };
                 let Some(m) = room.member_mut(&peer) else {
-                    return conns.error(conn, "not_found", "no longer in that room");
+                    return conns.reply(conn, re, "not_found", "no longer in that room");
                 };
                 if let Some(old) = m.conn.replace(conn) {
                     if old != conn {
@@ -929,21 +964,21 @@ impl App {
             In::Peek { code, key } => {
                 let reject = |conns: &mut Conns, code: &str, message: &str| {
                     self.metrics.joins_rejected.fetch_add(1, Ordering::Relaxed);
-                    conns.error(conn, code, message);
+                    conns.reply(conn, re, code, message);
                 };
-                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &app_id) {
+                if let Err((code, message)) = self.join_gate(&bound, rate, app_fails, ip, &fails) {
                     return reject(conns, code, message);
                 }
                 let code = code.trim().to_ascii_uppercase();
                 let Some(room) = app_rooms.get(&code) else {
-                    app_fail(app_fails, &app_id);
+                    app_fail(app_fails, &fails);
                     return reject(conns, "not_found", "no room with that code");
                 };
                 if room.version != version {
                     return reject(conns, "version_mismatch", "that room runs a different game version");
                 }
                 if !room.public && !key.as_deref().is_some_and(|k| ct_eq(k, &room.key)) {
-                    app_fail(app_fails, &app_id);
+                    app_fail(app_fails, &fails);
                     return reject(conns, "bad_key", "invalid room key");
                 }
                 let players = room.members.len();
@@ -995,22 +1030,22 @@ impl App {
 
             In::Signal { to, data } => {
                 let Some((code, me)) = bound else {
-                    return conns.error(conn, "not_in_room", "join a room first");
+                    return conns.reply(conn, re, "not_in_room", "join a room first");
                 };
                 let Some(room) = app_rooms.get(&code) else {
-                    return conns.error(conn, "not_in_room", "room no longer exists");
+                    return conns.reply(conn, re, "not_in_room", "room no longer exists");
                 };
                 if me != room.host && to != room.host {
-                    return conns.error(conn, "bad_message", "peers may only signal the host");
+                    return conns.reply(conn, re, "bad_message", "peers may only signal the host");
                 }
                 let Some(target) = room.member(&to).and_then(|m| m.conn) else {
-                    return conns.error(conn, "peer_unavailable", "that peer is not connected");
+                    return conns.reply(conn, re, "peer_unavailable", "that peer is not connected");
                 };
                 conns.send(target, &json!({ "t": "signal", "from": me, "data": data }));
             }
 
             In::Lock { locked } => {
-                if let Some(room) = host_room(app_rooms, &bound, conns, conn) {
+                if let Some(room) = host_room(app_rooms, &bound, conns, conn, re) {
                     room.locked = locked;
                     room.broadcast(conns, &room.meta_msg(), None);
                 }
@@ -1018,21 +1053,21 @@ impl App {
 
             In::Meta { meta } => {
                 if meta.to_string().len() > MAX_META_BYTES {
-                    return conns.error(conn, "meta_too_large", "meta must be 1 KB or less");
+                    return conns.reply(conn, re, "meta_too_large", "meta must be 1 KB or less");
                 }
-                if let Some(room) = host_room(app_rooms, &bound, conns, conn) {
+                if let Some(room) = host_room(app_rooms, &bound, conns, conn, re) {
                     room.meta = meta;
                     room.broadcast(conns, &room.meta_msg(), None);
                 }
             }
 
             In::Kick { peer } => {
-                if let Some(room) = host_room(app_rooms, &bound, conns, conn) {
+                if let Some(room) = host_room(app_rooms, &bound, conns, conn, re) {
                     if peer == room.host {
-                        return conns.error(conn, "bad_message", "the host cannot kick themselves");
+                        return conns.reply(conn, re, "bad_message", "the host cannot kick themselves");
                     }
                     if room.member(&peer).is_none() {
-                        return conns.error(conn, "peer_unavailable", "no such peer");
+                        return conns.reply(conn, re, "peer_unavailable", "no such peer");
                     }
                     remove_member(room, &peer, conns, resume, "kicked");
                 }
@@ -1040,7 +1075,7 @@ impl App {
 
             In::Leave => {
                 let Some((code, me)) = bound else {
-                    return conns.error(conn, "not_in_room", "not in a room");
+                    return conns.reply(conn, re, "not_in_room", "not in a room");
                 };
                 let is_host = app_rooms.get(&code).is_some_and(|r| r.host == me);
                 if is_host {
@@ -1240,7 +1275,10 @@ async fn run_socket(s: Arc<App>, socket: WebSocket, ip: IpAddr, origin: String) 
                 let mut inner = s.inner.lock().unwrap();
                 match serde_json::from_str::<In>(&text) {
                     Ok(m) => s.handle(&mut inner, conn, m),
-                    Err(_) => inner.conns.error(conn, "bad_message", "unrecognized message"),
+                    Err(_) => match serde_json::from_str::<Value>(&text).ok().as_ref().and_then(|v| v["t"].as_str()) {
+                        Some(re) => inner.conns.reply(conn, re, "bad_message", "unrecognized message"),
+                        None => inner.conns.error(conn, "bad_message", "unrecognized message"),
+                    },
                 }
                 s.reap_dead(&mut inner);
                 if !inner.conns.map.contains_key(&conn) {
@@ -1317,19 +1355,26 @@ fn rate_allow(
     entry.1 <= per_min
 }
 
-/// True while `app` has used up its failed-join budget for the current minute.
-fn app_fails_over(fails: &mut FailMap, app: &str, per_min: u32) -> bool {
+/// True while `key` (see `fail_keys`) has used up its failed-join budget for the current minute.
+fn app_fails_over(fails: &mut FailMap, key: &str, per_min: u32) -> bool {
     let now = Instant::now();
-    let entry = fails.entry(app.to_string()).or_insert((now, 0));
+    let entry = fails.entry(key.to_string()).or_insert((now, 0));
     if now - entry.0 >= Duration::from_secs(60) {
         *entry = (now, 0);
     }
     entry.1 >= per_min
 }
 
-/// Count one failed join or peek against `app`.
-fn app_fail(fails: &mut FailMap, app: &str) {
-    fails.entry(app.to_string()).or_insert((Instant::now(), 0)).1 += 1;
+/// The failed-join counters a join or peek from `ip_group` counts against: the app's, then the IP's within the app.
+fn fail_keys(app: &str, ip_group: &str) -> [String; 2] {
+    [app.to_string(), format!("{app} {ip_group}")]
+}
+
+/// Count one failed join or peek against the app and the IP.
+fn app_fail(fails: &mut FailMap, keys: &[String; 2]) {
+    for key in keys {
+        fails.entry(key.clone()).or_insert((Instant::now(), 0)).1 += 1;
+    }
 }
 
 /// IPv4 exact; IPv6 by /64, since every device on a v6 LAN has its own address.

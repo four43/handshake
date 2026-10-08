@@ -1180,3 +1180,63 @@ async fn failed_peeks_count_toward_app_limit() {
     good.send(json!({ "t": "peek", "code": room["code"] })).await;
     good.expect_error("rate_limited").await;
 }
+
+#[tokio::test]
+async fn failed_joins_limited_per_ip() {
+    let s = start_limits("ip_failed_joins_per_min = 2").await;
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+
+    let mut bad = s.client_at("game", 1, Some("198.51.100.1")).await;
+    for _ in 0..2 {
+        bad.send(json!({ "t": "join", "code": "ZZZZZ" })).await;
+        bad.expect_error("not_found").await;
+    }
+    // This IP used its failures: even a good code is refused for it...
+    bad.send(json!({ "t": "peek", "code": room["code"] })).await;
+    bad.expect_error("rate_limited").await;
+    // ...but not for anyone else.
+    s.client_at("game", 1, Some("203.0.113.9")).await.join(&room).await;
+}
+
+#[tokio::test]
+async fn ten_guessing_ips_do_not_lock_out_joins() {
+    let s = start_limits("joins_per_min = 20").await; // the default per-IP attempt budget
+    let mut host = s.client("game", 1).await;
+    let room = host.create(json!({ "public": true })).await;
+    for i in 0..10 {
+        let mut c = s.client_at("game", 1, Some(&format!("198.51.100.{i}"))).await;
+        for _ in 0..20 {
+            c.send(json!({ "t": "join", "code": "ZZZZZ" })).await;
+            assert_eq!(c.expect("error").await["re"], "join");
+        }
+    }
+    s.client_at("game", 1, Some("203.0.113.9")).await.join(&room).await;
+}
+
+#[tokio::test]
+async fn errors_name_the_request_they_answer() {
+    let s = start().await;
+    let (mut host, peer, hroom, proom) = room_with_peer(&s).await;
+    drop(peer);
+    host.expect("peer_away").await;
+    host.send(json!({ "t": "signal", "to": proom["you"], "data": {} })).await;
+    let e = host.expect("error").await;
+    assert_eq!((&e["code"], &e["re"]), (&json!("peer_unavailable"), &json!("signal")));
+    host.send(json!({ "t": "kick", "peer": "nobody" })).await;
+    assert_eq!(host.expect("error").await["re"], "kick");
+
+    let mut c = s.client("game", 1).await;
+    c.send(json!({ "t": "join", "code": "ZZZZZ" })).await;
+    assert_eq!(c.expect("error").await["re"], "join");
+    c.send(json!({ "t": "resume", "token": "nope" })).await;
+    assert_eq!(c.expect("error").await["re"], "resume");
+    c.send(json!({ "t": "lock", "locked": true })).await;
+    assert_eq!(c.expect("error").await["re"], "lock");
+    c.send(json!({ "t": "dance" })).await;
+    assert_eq!(c.expect("error").await["re"], "dance"); // unrecognized, but it has a type
+    c.ws.send(Message::Text("not json".into())).await.unwrap();
+    let e = c.expect("error").await;
+    assert_eq!((&e["code"], e.get("re")), (&json!("bad_message"), None));
+    let _ = hroom;
+}

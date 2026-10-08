@@ -89,10 +89,10 @@ const room = await hs.joinRoom(code, key); // key only for a private room
 | `version_mismatch` | The room runs a different game version |
 | `locked` | The host locked the room |
 | `full` | The room has `maxPlayers` members |
-| `rate_limited` | Too many join attempts from this IP, or too many failed attempts for this app |
+| `rate_limited` | Too many join attempts or failed attempts from this IP, or too many failed attempts for this app |
 | `already_in_room` | This client is already in a room |
 
-Join attempts are rate limited per IP (`joins_per_min`), and failed joins (`not_found`, `bad_key`) are also counted per app across all IPs (`app_failed_joins_per_min`), so codes and keys cannot be brute-forced from many addresses.
+Join attempts are rate limited per IP (`joins_per_min`). Failed joins (`not_found`, `bad_key`) are also counted per IP (`ip_failed_joins_per_min`) and per app across all IPs (`app_failed_joins_per_min`, a much higher ceiling), so codes and keys cannot be brute-forced from many addresses, and a few guessing addresses cannot lock everyone else out.
 
 ## Peeking before you join
 

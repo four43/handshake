@@ -15,7 +15,8 @@ room_max_age_secs = 43200
 idle_room_secs = 1800
 sessions_per_min = 30
 joins_per_min = 20
-app_failed_joins_per_min = 200   # wrong codes or keys per app per minute, all IPs together
+ip_failed_joins_per_min = 10     # wrong codes or keys per client IP (IPv6: per /64) per app per minute
+app_failed_joins_per_min = 2000  # wrong codes or keys per app per minute, all IPs together (a ceiling; keep it high)
 
 [turn]
 urls = [
