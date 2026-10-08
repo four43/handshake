@@ -4,7 +4,9 @@ import { LinkButton } from '@astrojs/starlight/components';
 import Flow, { type FlowEdge, type FlowNode } from './Flow.astro';
 
 const { data } = Astro.locals.starlightRoute.entry;
-const { title = data.title, tagline, actions = [] } = data.hero || {};
+const { title: rawTitle = data.title, tagline, actions = [] } = data.hero || {};
+// `*word*` in the title is the lime highlight; plain Markdown, so llms.txt reads it cleanly.
+const title = rawTitle.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!).replace(/\*([^*]+)\*/g, '<em>$1</em>');
 // Frontmatter links are root-relative without the deploy base, like content links.
 const withBase = (href: string) => (href.startsWith('/') ? import.meta.env.BASE_URL.replace(/\/$/, '') + href : href);
 

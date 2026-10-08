@@ -3,7 +3,7 @@ title: Quickstart
 description: Run a Handshake server locally, add the client to a game, and connect two browser tabs.
 ---
 
-This page gets two browser tabs talking over WebRTC through a local Handshake server. You need Docker and a game (or any page) served from `http://localhost`.
+This page gets two browser tabs talking over WebRTC through a local Handshake server. You need Docker and a game (or any page) served from `http://localhost`. Any static server works, for example `npx serve .` or `python3 -m http.server 5173` in your game's folder.
 
 ## 1. Write a config
 
@@ -29,7 +29,7 @@ No `[turn]` section is needed for two tabs on one machine. See [Connectivity](/g
 
 ## 2. Run the server
 
-Images are published to the GitHub Container Registry. A push to `main` publishes `ghcr.io/four43/handshake:<short commit hash>`; a git tag publishes `ghcr.io/four43/handshake:<tag>`. There is no `latest` tag, so pick one from the [package page](https://github.com/four43/handshake/pkgs/container/handshake).
+Images are published to the GitHub Container Registry. A push to `main` publishes `ghcr.io/four43/handshake:<short commit hash>`; a git tag publishes `ghcr.io/four43/handshake:<tag>`. There is no `latest` tag, so pick one from the [package page](https://github.com/four43/handshake/pkgs/container/handshake), for example `ghcr.io/four43/handshake:577b002`. Images are public; no login is needed.
 
 ```bash
 docker run --rm -p 8080:8080 \
@@ -48,7 +48,7 @@ docker run --rm -p 8080:8080 \
   handshake
 ```
 
-`SESSION_SECRET` is required and must be at least 32 characters. Check that the server is up:
+`SESSION_SECRET` is required and must be at least 32 characters. A fresh random one per run is fine locally. In production generate it once and keep it in your environment; rotate it with `SESSION_SECRET_PREV` (see [Self-hosting](/guides/self-hosting/)). Check that the server is up:
 
 ```bash
 curl http://localhost:8080/healthz   # ok
@@ -56,7 +56,13 @@ curl http://localhost:8080/healthz   # ok
 
 ## 3. Add the client to your game
 
-The client is one ES module with no dependencies and no build step. Copy [`client/handshake.js`](https://github.com/four43/handshake/blob/main/client/handshake.js) into your game and import it:
+The client is one ES module with no dependencies and no build step. Copy [`client/handshake.js`](https://github.com/four43/handshake/blob/main/client/handshake.js) into your game:
+
+```bash
+curl -O https://raw.githubusercontent.com/four43/handshake/main/client/handshake.js
+```
+
+Then import it:
 
 ```js
 import { Handshake, HandshakeError } from './handshake.js';

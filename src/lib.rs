@@ -144,7 +144,7 @@ pub struct TurnConfig {
 
 /// What `list` returns for an app.
 #[derive(Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, derive(schemars::JsonSchema, serde::Serialize))] // Serialize: the schema shows the default
 pub enum ListMode {
     /// Public rooms for the caller's version, nearby first (docs/specs/handshake-server.md "Public listing").
     #[default]

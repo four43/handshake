@@ -68,6 +68,45 @@ export function connectionType(stats) {
   return local?.candidateType === 'relay' || remote?.candidateType === 'relay' ? 'relayed' : 'direct';
 }
 
+/**
+ * A room seen from outside, as `peek` returns it.
+ * @typedef {object} RoomInfo
+ * @property {string} code the 5-character join code
+ * @property {string} name the room's name
+ * @property {number} players members now, host included
+ * @property {number} maxPlayers room size, host included
+ * @property {boolean} locked the host stopped new joins
+ * @property {boolean} full no seat left
+ */
+
+/**
+ * A public room in the lobby, as `listRooms` returns it.
+ * @typedef {object} ListedRoom
+ * @property {string} code the 5-character join code
+ * @property {string} name the room's name
+ * @property {number} players members now, host included
+ * @property {number} maxPlayers room size, host included
+ * @property {any} meta the host's metadata (map, mode...), or null
+ * @property {boolean} nearby the host is on your network (same public IP)
+ */
+
+/**
+ * A member of a room, host included.
+ * @typedef {object} Member
+ * @property {string} id peer id
+ * @property {string} name display name
+ * @property {boolean} nearby on the host's network (same public IP); always true for the host
+ * @property {boolean} away the socket dropped; the seat is held for the grace period
+ */
+
+/**
+ * The client: one per player. It fetches session tokens and TURN credentials, keeps the signaling socket open,
+ * resumes after drops and sets up a WebRTC connection to each peer.
+ *
+ * Every promise rejects with a {@link HandshakeError}. Its `code` is a server error code or `network`, `timeout`
+ * or `closed`. Any call can fail with `network`, `timeout`, `closed`, `rate_limited`, `origin` (the page's origin is
+ * not allowed for the app) or `not_found` (unknown app id).
+ */
 export class Handshake {
   #o; #token = null; #tokenUntil = 0; #turn = false; #ice = []; #iceUntil = 0;
   #ws = null; #welcomed = false; #connecting = null; #waiters = []; #queue = [];
@@ -92,9 +131,10 @@ export class Handshake {
   }
 
   /**
-   * Look at a room without joining it.
-   * @param {string} code @param {string} [key] needed for a private room
-   * @returns {Promise<{ code: string, name: string, players: number, maxPlayers: number, locked: boolean, full: boolean }>}
+   * Look at a room without joining it, e.g. to show "Join this room?". Counts as a join attempt for rate limits.
+   * @param {string} code the join code (case-insensitive) @param {string} [key] needed for a private room
+   * @returns {Promise<RoomInfo>}
+   * @throws {HandshakeError} `not_found`, `bad_key`, `version_mismatch`, `already_in_room`, `rate_limited`
    */
   async peek(code, key) {
     const m = await this.#request({ t: 'peek', code: String(code).trim().toUpperCase(), key }, 'room_info');
@@ -102,8 +142,9 @@ export class Handshake {
   }
 
   /**
-   * The app's open public rooms for your version, nearby first (empty when the app does not list rooms).
-   * @returns {Promise<{ code: string, name: string, players: number, maxPlayers: number, meta: any, nearby: boolean }[]>}
+   * The app's open public rooms for your version: unlocked, not full, host present, nearby first, at most 50.
+   * Empty when the app sets `list = "none"`.
+   * @returns {Promise<ListedRoom[]>}
    */
   async listRooms() {
     const m = await this.#request({ t: 'list' }, 'rooms');
@@ -111,8 +152,15 @@ export class Handshake {
   }
 
   /**
-   * @param {{ public?: boolean, maxPlayers?: number, meta?: any, name?: string }} [o] `name` is the room's name in listings
+   * Create a room and become its host.
+   * @param {object} [o]
+   * @param {boolean} [o.public] joinable with the code alone, and listed unless the app sets `list = "none"`;
+   *   needs `public_rooms` on the app. Default false: guests need the code and the key.
+   * @param {number} [o.maxPlayers] room size, host included, from 2 up to the app's `max_players` (the default)
+   * @param {any} [o.meta] any JSON (at most 1 KB) the lobby shows, such as map or mode; the server never reads it
+   * @param {string} [o.name] the room's name in listings (cut to 32 characters)
    * @returns {Promise<Room>}
+   * @throws {HandshakeError} `already_in_room`, `public_disabled`, `too_many_rooms`, `meta_too_large`
    */
   async createRoom({ public: pub = false, maxPlayers, meta, name } = {}) {
     if (this.#room) throw new HandshakeError('already_in_room');
@@ -121,7 +169,13 @@ export class Handshake {
     return this.#enter(m.room);
   }
 
-  /** @param {string} code @param {string} [key] needed for a private room @returns {Promise<Room>} */
+  /**
+   * Join a room by code.
+   * @param {string} code the join code (case-insensitive) @param {string} [key] needed for a private room
+   * @returns {Promise<Room>}
+   * @throws {HandshakeError} `not_found`, `bad_key`, `version_mismatch`, `locked`, `full`, `already_in_room`,
+   *   `rate_limited`
+   */
   async joinRoom(code, key) {
     if (this.#room) throw new HandshakeError('already_in_room');
     await this.#iceServers();
@@ -134,6 +188,7 @@ export class Handshake {
    * has no room code, so a game can call it on every page load.
    * @param {string} [url] defaults to the page's URL
    * @returns {Promise<Room | null>}
+   * @throws {HandshakeError} as `joinRoom`
    */
   async joinFromUrl(url = globalThis.location?.href) {
     const params = url ? new URL(url).searchParams : null;
@@ -422,17 +477,19 @@ class Room extends Emitter {
   constructor(link, r, key) {
     super();
     this.#link = link;
-    /** @type {string} */ this.code = r.code;
-    /** @type {string} */ this.name = r.name;
+    /** @type {string} the 5-character join code */ this.code = r.code;
+    /** @type {string} the room's name */ this.name = r.name;
     /** @type {string | null} the private key: from the server for the host, the one you joined with for a guest */
     this.key = r.key ?? key ?? null;
-    /** @type {boolean} */ this.isHost = !!r.is_host;
-    /** @type {string} */ this.you = r.you;
-    /** @type {string} */ this.hostId = r.host;
-    /** @type {boolean} */ this.locked = !!r.locked;
-    /** @type {any} */ this.meta = r.meta ?? null;
-    /** @type {{ id: string, name: string, nearby: boolean, away: boolean }[]} */ this.members = r.peers.map(member);
-    /** @type {Map<string, Peer>} */ this.peers = new Map();
+    /** @type {boolean} you created this room */ this.isHost = !!r.is_host;
+    /** @type {string} your peer id */ this.you = r.you;
+    /** @type {string} the host's peer id */ this.hostId = r.host;
+    /** @type {boolean} new joins are refused (see `lock`) */ this.locked = !!r.locked;
+    /** @type {any} the host's metadata (see `setMeta`), or null */ this.meta = r.meta ?? null;
+    /** @type {Member[]} everyone in the room, host included, in join order (updated by `members` events) */
+    this.members = r.peers.map(member);
+    /** @type {Map<string, Peer>} open or opening connections by peer id: each guest for the host, the host for a guest */
+    this.peers = new Map();
     /** @type {boolean} true after `closed` */ this.closed = false;
     if (!this.isHost) this.#addPeer(this.hostId, false); // the host sends the offer
   }
@@ -452,6 +509,7 @@ class Room extends Emitter {
   setMeta(meta) { return this.#control({ t: 'meta', meta }, 'room_meta'); }
   /** Host only: remove a peer; it can rejoin unless the room is locked. @param {string} peerId @returns {Promise<void>} */
   kick(peerId) { return this.#control({ t: 'kick', peer: peerId }, 'peer_left', m => m.peer === peerId); }
+  /** Leave the room (the host leaving closes it for everyone). The client stays connected for another room. */
   leave() { this.#link.leave(); }
 
   async #control(msg, want, match) {
@@ -549,11 +607,12 @@ class Peer extends Emitter {
     this.#initiator = initiator;
     this.#opened = opened;
     this.#gone = gone;
-    /** @type {string} */ this.id = id;
+    /** @type {string} the other side's peer id */ this.id = id;
     /** @type {string} the player's display name */ this.name = name;
-    /** @type {boolean} */ this.nearby = nearby;
-    /** @type {'direct' | 'relayed' | null} */ this.connectionType = null;
-    /** @type {boolean} */ this.open = false;
+    /** @type {boolean} the guest is on the host's network (same public IP) */ this.nearby = nearby;
+    /** @type {'direct' | 'relayed' | null} through a TURN relay or not; null until known (see the `type` event) */
+    this.connectionType = null;
+    /** @type {boolean} both data channels are open, so `send` works */ this.open = false;
     const config = { iceServers: link.ice() };
     if (link.relayUnlessNearby && !nearby) config.iceTransportPolicy = 'relay';
     const pc = (this.#pc = new link.RTCPeerConnection(config));

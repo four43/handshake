@@ -59,7 +59,8 @@
       "properties": {
         "list": {
           "description": "What `list` returns: `\"all\"` lists public rooms, `\"none\"` lists nothing.",
-          "$ref": "#/$defs/ListMode"
+          "$ref": "#/$defs/ListMode",
+          "default": "all"
         },
         "max_players": {
           "description": "Most members in a room, host included. A room can ask for fewer.",

@@ -1,10 +1,25 @@
 ---
-title: Handshake
-description: A tiny self-hosted WebRTC signaling server and room registry for browser games.
+title: WebRTC signaling and rooms for browser games
+description: Handshake is a tiny self-hosted WebRTC signaling server and room registry for browser games, with a dependency-free JavaScript client. Rooms, join codes, TURN credentials and reconnects; game data goes peer to peer.
 template: splash
 editUrl: false
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: |
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        "name": "Handshake",
+        "description": "Self-hosted WebRTC signaling server and room registry for browser games, with a dependency-free JavaScript client.",
+        "codeRepository": "https://github.com/four43/handshake",
+        "programmingLanguage": ["Rust", "JavaScript"],
+        "runtimePlatform": "Docker",
+        "keywords": "WebRTC, signaling server, matchmaking, rooms, TURN, peer to peer, multiplayer, browser games"
+      }
 hero:
-  title: Get players <em>connected</em>. Then get out of the way.
+  title: Get players *connected*. Then get out of the way.
   tagline: Handshake is a tiny self-hosted signaling server and room registry for WebRTC browser games. It handles rooms, join codes, TURN credentials and reconnects, then your game talks peer to peer.
   actions:
     - text: Quick start
@@ -142,6 +157,7 @@ try {
     <LinkButton href="quickstart/" icon="right-arrow">Quick start</LinkButton>
     <LinkButton href="guides/self-hosting/" variant="secondary">Self-hosting guide</LinkButton>
   </div>
+  <p class="hs-llms">Using an AI assistant? Point it at <a href="llms.txt">llms.txt</a> or <a href="llms-full.txt">llms-full.txt</a>.</p>
 </div>
 
 <style>{`
@@ -170,6 +186,8 @@ try {
     background: radial-gradient(30rem 14rem at 50% 0%, var(--hs-hero-glow), transparent 70%), var(--hs-surface);
   }
   .hs-cta .hs-lede { margin-inline: auto; }
+  .hs-llms { margin: 1.75rem 0 0; font-size: var(--sl-text-sm); color: var(--sl-color-gray-3); }
+  .hs-llms a { color: var(--sl-color-text-accent); }
   .hs-cta-actions { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; margin-top: 2rem; }
   @media (min-width: 60rem) {
     .hs-split { grid-template-columns: 1fr 1.25fr; }
