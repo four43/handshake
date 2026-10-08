@@ -301,9 +301,12 @@ The library owns everything every game would otherwise repeat:
 - WebSocket connect, `hello`, heartbeat and automatic `resume` after drops
 - `RTCPeerConnection` setup, both data channels, offer/answer and ICE exchange
 - ICE restart on network change, `visibilitychange` handling, Wake Lock request
+- a new peer connection when one closes by itself (the host offers again, marked `new`; a guest asks with `{restart: true, rebuild: true}`), backing off while it keeps failing
+- a send skipped (returns false) while a channel holds more than 64 KB (`state`) or 1 MB (`events`) not yet sent
 - connection-type detection through `getStats()`
 - host controls (`lock`, `setMeta`, `kick`) that return promises settling on the server's answer
-- relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`
+- relay-only connections (`iceTransportPolicy: "relay"`) to peers that are not `nearby`, when the game passes `relayUnlessNearby: true`; without TURN credentials (none offered, or `/turn` failed twice) `createRoom` and `joinRoom` then fail with `no_turn`
+- server errors matched to the request they answer by `re`
 
 Reliable messages that are plain objects are JSON-encoded; ArrayBuffers pass through untouched on either channel.
 
