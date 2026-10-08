@@ -353,7 +353,7 @@ struct Member {
     resume: String,
     conn: Option<ConnId>,
     away_since: Option<Instant>,
-    ip_group: String, // at join time; compared with the room's host_ip_group for `nearby`
+    ip_group: String, // net_group at join time; compared with the room's host_ip_group for `nearby`
 }
 
 #[derive(Deserialize)]
@@ -818,6 +818,7 @@ impl App {
         };
         let (app_id, version, ip, ip_group, bound) =
             (c.app.clone(), c.version, c.ip, c.ip_group.clone(), c.room.clone());
+        let near = net_group(ip); // for `nearby`; ip_group stays per address for the rate limits
         let Some(app) = self.cfg.apps.get(&app_id) else {
             return;
         };
@@ -866,9 +867,9 @@ impl App {
                         resume: host_resume.clone(),
                         conn: Some(conn),
                         away_since: None,
-                        ip_group: ip_group.clone(),
+                        ip_group: near.clone(),
                     }],
-                    host_ip_group: ip_group,
+                    host_ip_group: near.clone(),
                     created: Instant::now(),
                     alone_since: Some(Instant::now()),
                 };
@@ -914,9 +915,9 @@ impl App {
                     resume: peer_resume.clone(),
                     conn: Some(conn),
                     away_since: None,
-                    ip_group: ip_group.clone(),
+                    ip_group: near.clone(),
                 });
-                let nearby = ip_group == room.host_ip_group;
+                let nearby = near == room.host_ip_group;
                 room.alone_since = None;
                 resume.insert(peer_resume, (app_id.clone(), code.clone(), peer.clone()));
                 conns.bind(conn, &code, &peer);
@@ -1010,7 +1011,7 @@ impl App {
                             && r.host_present()
                     })
                     .collect();
-                listed.sort_by_key(|r| (r.host_ip_group != ip_group, std::cmp::Reverse(r.created)));
+                listed.sort_by_key(|r| (r.host_ip_group != near, std::cmp::Reverse(r.created)));
                 let rooms: Vec<Value> = listed
                     .into_iter()
                     .take(MAX_LISTED)
@@ -1021,7 +1022,7 @@ impl App {
                             "players": r.members.len(),
                             "max_players": r.max_players,
                             "meta": r.meta,
-                            "nearby": r.host_ip_group == ip_group,
+                            "nearby": r.host_ip_group == near,
                         })
                     })
                     .collect();
@@ -1378,6 +1379,18 @@ fn app_fail(fails: &mut FailMap, keys: &[String; 2]) {
 }
 
 /// IPv4 exact; IPv6 by /64, since every device on a v6 LAN has its own address.
+/// The network a client is on, for `nearby`. A private IPv4 address (10/8, 172.16/12, 192.168/16) groups by its /24:
+/// when the server is on the players' own LAN (split DNS), each device arrives with its own private address, and devices on
+/// one home network must still be nearby. Any other address groups as `ip_group` does (exact IPv4, IPv6 /64); shared
+/// carrier NAT (100.64/10) is not a home network, so it stays exact.
+fn net_group(ip: IpAddr) -> String {
+    let v4 = match ip { IpAddr::V4(v4) => Some(v4), IpAddr::V6(v6) => v6.to_ipv4_mapped() };
+    match v4 {
+        Some(v4) if v4.is_private() => { let o = v4.octets(); format!("{}.{}.{}.0/24", o[0], o[1], o[2]) }
+        _ => ip_group(ip),
+    }
+}
+
 fn ip_group(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => v4.to_string(),
@@ -1641,6 +1654,20 @@ mod tests {
     }
 
     // ---- network helpers ------------------------------------------------
+
+    #[test]
+    fn net_group_private_v4_by_24_else_like_ip_group() {
+        let n = |s: &str| net_group(s.parse().unwrap());
+        assert_eq!(n("192.168.1.20"), n("192.168.1.30"));
+        assert_eq!(n("192.168.1.20"), "192.168.1.0/24");
+        assert_ne!(n("192.168.1.20"), n("192.168.2.20"));
+        assert_eq!(n("10.0.5.1"), n("10.0.5.200"));
+        assert_eq!(n("172.16.4.9"), n("172.16.4.10"));
+        assert_eq!(n("::ffff:192.168.1.7"), "192.168.1.0/24");
+        assert_ne!(n("100.64.0.1"), n("100.64.0.2")); // carrier NAT is not one home
+        assert_ne!(n("203.0.113.5"), n("203.0.113.6"));
+        assert_eq!(n("2001:db8:1:2::10"), "2001:db8:1:2::/64");
+    }
 
     #[test]
     fn ip_group_v4_exact_v6_by_64() {

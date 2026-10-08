@@ -694,6 +694,21 @@ async fn signal_relay_host_and_peers_only() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn devices_on_one_home_network_are_nearby() {
+    // The server on the players' own LAN (split DNS): each device arrives with its own private address.
+    let s = start().await;
+    let mut host = s.client_at("game", 1, Some("192.168.1.20")).await;
+    let room = host.create(json!({ "public": true })).await;
+    let mut same_lan = s.client_at("game", 1, Some("192.168.1.30")).await;
+    let joined = same_lan.join(&room).await;
+    assert_eq!(joined["peers"][1]["nearby"], true);
+    assert_eq!(host.expect("peer_joined").await["nearby"], true);
+    let mut other_lan = s.client_at("game", 1, Some("192.168.2.30")).await;
+    other_lan.join(&room).await;
+    assert_eq!(host.expect("peer_joined").await["nearby"], false);
+}
+
+#[tokio::test]
 async fn list_public_rooms() {
     let s = start().await;
     let far = Some("198.51.100.7");
