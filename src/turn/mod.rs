@@ -1,6 +1,7 @@
 //! The built-in TURN server (docs/specs/builtin-turn.md): STUN Binding plus TURN over UDP and TCP, relaying UDP
 //! for browsers whose players cannot connect directly. TLS (`turns:`) is the reverse proxy's job.
 
+pub mod allocation;
 pub mod auth;
 pub mod proxy;
 pub mod stun;
