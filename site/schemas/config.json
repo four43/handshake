@@ -177,9 +177,59 @@
       ]
     },
     "TurnConfig": {
-      "description": "The companion coturn server. Its `static-auth-secret` must equal `TURN_SECRET`.",
+      "description": "The TURN relay. With `relay_ports` set, Handshake runs it itself (docs/specs/builtin-turn.md); without, it mints\ncredentials for an external coturn whose `static-auth-secret` equals `TURN_SECRET`.",
       "type": "object",
       "properties": {
+        "allocations_per_ip": {
+          "description": "Built-in server: most allocations per client IP. A relay-only host needs about three per guest (UDP, TCP, TLS).",
+          "type": "integer",
+          "format": "uint",
+          "default": 64,
+          "minimum": 0
+        },
+        "allowed_peers": {
+          "description": "Built-in server: peer ranges the relay may send to although they are private, loopback or otherwise forbidden.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "external_ip": {
+          "description": "Built-in server: the public IPv4 address clients and peers reach the relay ports on, or a hostname that\nresolves to it (re-resolved every minute, for a home connection whose address changes). Required with\n`relay_ports`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kbps_per_allocation": {
+          "description": "Built-in server: relayed traffic per allocation and direction, in kilobits per second. Packets over it are dropped.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 2000,
+          "minimum": 0
+        },
+        "listen": {
+          "description": "Built-in server: address and port for TURN over UDP and TCP.",
+          "type": "string",
+          "default": "0.0.0.0:3478"
+        },
+        "max_allocations": {
+          "description": "Built-in server: most allocations at once.",
+          "type": "integer",
+          "format": "uint",
+          "default": 500,
+          "minimum": 0
+        },
+        "relay_ports": {
+          "description": "Built-in server: UDP ports for relay addresses, one per allocation, e.g. `\"49160-49200\"`. Setting it starts\nthe built-in server.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "ttl_secs": {
           "description": "Lifetime of a TURN credential, in seconds.",
           "type": "integer",

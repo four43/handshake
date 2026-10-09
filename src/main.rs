@@ -90,7 +90,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             session_keys.push(prev.into_bytes());
         }
     }
-    let turn_key = env::var("TURN_SECRET").ok().filter(|s| !s.is_empty()).map(String::into_bytes);
+    let builtin_turn = cfg.turn.as_ref().is_some_and(|t| t.builtin());
+    let mut turn_key = env::var("TURN_SECRET").ok().filter(|s| !s.is_empty()).map(String::into_bytes);
+    if builtin_turn && turn_key.is_none() {
+        // Nothing outside this process checks TURN credentials, so a fresh secret per run is enough.
+        let mut key = vec![0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+        turn_key = Some(key);
+    }
     if cfg.turn.is_some() && turn_key.is_none() {
         warn!("[turn] is configured but TURN_SECRET is not set; /turn will return 503");
     }
