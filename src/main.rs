@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use handshake::{default_listen, serve, App, Config};
+use handshake::{default_listen, serve, turn::TurnServer, App, Config};
 use tracing::{info, warn};
 
 /// `handshake --healthcheck`: distroless has no curl, so the binary probes itself.
@@ -103,7 +103,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let listen: SocketAddr = cfg.listen.parse()?;
-    let state = Arc::new(App::new(cfg, session_keys, turn_key));
+    let state = Arc::new(App::new(cfg, session_keys, turn_key.clone()));
+    let _turn = match (builtin_turn, turn_key) {
+        (true, Some(key)) => Some(TurnServer::start(state.config(), key, state.turn_stats()).await?),
+        _ => None,
+    };
 
     info!(%listen, apps = state.config().apps.len(), "handshake listening");
     let listener = tokio::net::TcpListener::bind(listen).await?;
