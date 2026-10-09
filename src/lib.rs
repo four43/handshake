@@ -31,7 +31,7 @@ use axum::{
     Json, Router,
 };
 use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::URL_SAFE_NO_PAD,
     Engine,
 };
 use futures_util::{stream::SplitStream, SinkExt, StreamExt};
@@ -39,7 +39,6 @@ use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha1::Sha1;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -1252,7 +1251,7 @@ async fn turn(State(s): State<Arc<App>>, headers: HeaderMap) -> Response {
     };
     // coturn use-auth-secret: username "<expiry>:<anything>", password b64(HMAC-SHA1(secret, username)).
     let username = format!("{}:{}", now_unix() + tc.ttl_secs, claims.a);
-    let credential = turn_credential(key, &username);
+    let credential = turn::auth::password(key, &username);
     s.metrics.turn.fetch_add(1, Ordering::Relaxed);
     Json(json!({
         "ice_servers": [{ "urls": tc.urls, "username": username, "credential": credential }],
@@ -1414,13 +1413,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
-}
-
-/// coturn use-auth-secret password: base64(HMAC-SHA1(secret, username)).
-fn turn_credential(key: &[u8], username: &str) -> String {
-    let mut mac = <Hmac<Sha1>>::new_from_slice(key).expect("hmac accepts any key length");
-    mac.update(username.as_bytes());
-    STANDARD.encode(mac.finalize().into_bytes())
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -1711,19 +1703,6 @@ mod tests {
         for junk in ["", ".", "nodot", &format!("{payload}."), &format!(".{sig}"), "!!!.???"] {
             assert!(app.verify_token(junk).is_none(), "{junk:?}");
         }
-    }
-
-    // ---- TURN -----------------------------------------------------------
-
-    #[test]
-    fn turn_credential_matches_coturn_scheme() {
-        // Known-answer HMAC-SHA1, computed independently:
-        //   printf '1700000000:game' | openssl dgst -sha1 -hmac turn-secret -binary | base64
-        assert_eq!(turn_credential(b"turn-secret", "1700000000:game"), "n12nWdEgEYR9Wpg+vbxX8n3V8VA=");
-        // 20-byte SHA1 digest -> 28 base64 chars with padding.
-        let cred = turn_credential(b"k", "1:a");
-        assert_eq!(STANDARD.decode(&cred).unwrap().len(), 20);
-        assert_ne!(cred, turn_credential(b"k", "2:a"));
     }
 
     // ---- codes, names, ids ----------------------------------------------
