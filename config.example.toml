@@ -35,6 +35,7 @@ max_allocations = 500
 allocations_per_ip = 64
 kbps_per_allocation = 2000
 # allowed_peers = []               # private ranges the relay may send to anyway (tests, LAN-only setups)
+# proxy_protocol_from = []         # who may send a PROXY v2 header: the proxy terminating turns:, e.g. its Docker network
 
 [apps.pig-pens]
 origins = ["https://seth.github.io"]

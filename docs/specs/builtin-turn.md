@@ -23,7 +23,7 @@ In:
 - STUN Binding (Handshake doubles as the STUN server; no Google STUN needed).
 - TURN (RFC 8656) as browsers use it: Allocate, Refresh, CreatePermission, ChannelBind, Send and Data indications,
   ChannelData; long-term credentials; UDP relaying of IPv4.
-- Client transports: UDP and TCP on one port (default 3478). PROXY protocol v2 on TCP from `trusted_proxies`.
+- Client transports: UDP and TCP on one port (default 3478). PROXY protocol v2 on TCP from `proxy_protocol_from`.
 - Quotas, bandwidth caps, forbidden peer ranges, metrics.
 - Docs: built-in TURN, the Caddy `turns:` setup, router/firewall ports, migrating from coturn.
 
@@ -57,6 +57,7 @@ max_allocations = 500              # whole server
 allocations_per_ip = 64            # per client IP (a relay-only host needs about 3 per guest: udp, tcp, turns)
 kbps_per_allocation = 2000         # relayed traffic per allocation, each direction; excess is dropped
 allowed_peers = []                 # peer ranges exempt from the forbidden list below (tests, LAN setups)
+proxy_protocol_from = []           # TCP peers whose PROXY v2 header is believed: the proxy terminating turns:
 ```
 
 - **`external_ip`** is the address put in XOR-RELAYED-ADDRESS: the host's public IPv4. A hostname suits a home
@@ -67,6 +68,8 @@ allowed_peers = []                 # peer ranges exempt from the forbidden list 
   changing anything else.
 - **`/session`** reports `"turn": true` when the app has `turn = true`, `[turn]` exists, and there is a secret
   (configured or generated).
+- **Limits.** `max_allocations`, `allocations_per_ip` and `kbps_per_allocation` must be at least 1; startup fails
+  otherwise.
 - **Ports.** The relay range must be reachable from the internet over UDP, along with `listen` over UDP and TCP.
   Docker publishes a range of ~40 ports fine; host networking is not required.
 
@@ -120,7 +123,8 @@ Keyed by the 5-tuple: for UDP the client address plus the listening socket; for 
 - **Allocate**: auth, then 437 if one exists (unless it is a retransmission: the same transaction ID gets the cached
   response), quota checks (486 per IP, 508 server-wide or no free port), bind a UDP socket on a free port in
   `relay_ports`, reply with XOR-RELAYED-ADDRESS, XOR-MAPPED-ADDRESS and LIFETIME.
-- **Refresh**: new LIFETIME; 0 deletes. 437 if there is no allocation.
+- **Refresh**: new LIFETIME; 0 deletes. 437 if there is no allocation. The response to a deleting Refresh is kept for
+  40 s, so a retransmission of it (the response was lost) gets the same success instead of 437.
 - **CreatePermission**: one or more XOR-PEER-ADDRESS; each peer IP gets a 300 s permission. A forbidden peer → 403
   and no permissions from that request.
 - **ChannelBind**: binds channel ↔ peer address for 600 s (also installs/refreshes the permission). A channel already
@@ -129,25 +133,37 @@ Keyed by the 5-tuple: for UDP the client address plus the listening socket; for 
   from the relay socket.
 - **Relay socket receives**: dropped unless the source IP has a permission; sent to the client as ChannelData when the
   source address has a channel, else as a Data indication.
-- **Expiry**: a sweep every few seconds drops expired allocations, permissions and channels. Closing a TCP connection
-  deletes its allocation at once.
+- **Expiry**: an allocation past its lifetime is gone at once: it relays nothing, Refresh and the other requests get
+  437, and a new Allocate on the same 5-tuple replaces it. A sweep every few seconds then frees its port and drops
+  expired permissions and channels. Closing a TCP connection deletes its allocation at once.
+- **Relay socket buffer**: 4 KiB per allocation. A datagram from a peer that fills it may have been cut short and is
+  dropped, so peers can send at most 4095 bytes (WebRTC stays under about 1500).
 
 ### Limits and safety
 
 - **Forbidden peers** (403, never relayed to; `external_ip` itself is fine): loopback, unspecified, private (10/8, 172.16/12, 192.168/16),
-  carrier-grade NAT (100.64/10), link-local (169.254/16, includes cloud metadata), multicast, broadcast, reserved
-  (240/4), 0/8. `allowed_peers` exempts ranges. Without this, the relay is a path into the server's own network.
+  carrier-grade NAT (100.64/10), link-local (169.254/16, includes cloud metadata), special-use (192.0.0/24 IETF
+  protocol assignments, 192.0.2/24, 198.51.100/24 and 203.0.113/24 documentation, 192.88.99/24 6to4 relay,
+  198.18/15 benchmarking, which fake-IP proxies route internally), multicast, broadcast, reserved (240/4), 0/8. `allowed_peers` exempts ranges. Without this, the relay is a path into the server's own network.
 - **Amplification**: an unauthenticated request gets an error response no bigger than it needs (401 is small);
   nothing is relayed before auth.
-- **Bandwidth**: per allocation, a token bucket per direction at `kbps_per_allocation`; packets over it are dropped.
+- **Bandwidth**: per allocation, a token bucket per direction at `kbps_per_allocation` with a burst of one second's
+  worth, never less than 64 KiB (so a low rate slows traffic instead of dropping every packet); packets over it are
+  dropped.
 - **Quotas**: `max_allocations`, `allocations_per_ip` (by client IP from the PROXY header when present).
-- **TCP**: at most `max_allocations` + 256 connections at once (more are closed on accept); a connection must send a complete first message within 10 s (and, from a trusted proxy, its PROXY header);
-  without an allocation it is closed after 30 s idle; at most 64 KiB buffered per frame.
-- **PROXY protocol v2**: honored only from peers in `trusted_proxies`, and optional there: a trusted peer's connection
-  that starts with the v2 signature (first byte `0x0D`; STUN and ChannelData never start with it) is read as coming
-  from the address in the header, anything else as a direct client. The default `trusted_proxies` covers LAN ranges,
-  so requiring the header would cut off LAN players using TCP TURN directly. From untrusted peers the header is never
-  parsed (the connection fails as an invalid frame). v1 (text) is not supported.
+- **TCP**: at most `max_allocations` + 256 connections at once (more are closed on accept), and at most
+  `allocations_per_ip` + 4 per client IP (the address in the PROXY header when there is one). Deadlines run from when
+  the connection opened, so trickling bytes buys no time: the first complete message (and, from a proxy, its PROXY
+  header) must arrive within 10 s, and a connection without an allocation is closed 30 s after it opened, however
+  many Binding requests it sends. With an allocation it stays open until the allocation is gone. At most 64 KiB
+  buffered per frame.
+- **PROXY protocol v2**: honored only from peers in `[turn].proxy_protocol_from`, and optional there: such a peer's
+  connection that starts with the v2 signature (first byte `0x0D`; STUN and ChannelData never start with it) is read
+  as coming from the address in the header, anything else as a direct client (LAN players on the proxy's network using
+  TCP TURN directly). The list is empty by default and separate from `trusted_proxies`: whoever is in it can claim any
+  address, which sidesteps per-IP quotas and the nonce's IP binding, and `trusted_proxies` defaults to every private
+  range, which can include internet clients behind Docker's userland proxy or Kubernetes SNAT. From other peers the
+  header is never parsed (the connection fails as an invalid frame). v1 (text) is not supported.
 - **Relay to relay on this server**: a Send/ChannelData to `external_ip` at a port in `relay_ports` that belongs to a
   live allocation is delivered in-process, as if that relay socket had received it from the sender's relay address.
   Two relayed players are common (both on cellular), and the alternative depends on the router hairpinning its own
@@ -200,6 +216,6 @@ next to the HTTP server when `relay_ports` is set. New dependency: `md-5` (RustC
 
 - `guides/connectivity.md`: TURN is built in; how to turn it on; credentials unchanged.
 - `guides/self-hosting.md`: no coturn; ports to open/forward; `external_ip`; the Caddy `turns:` setup (xcaddy build,
-  listener wrapper, cert site block, `trusted_proxies`), from the spike; migrating from coturn.
+  listener wrapper, cert site block, `proxy_protocol_from`), from the spike; migrating from coturn.
 - Config reference (generated schema), `config.example.toml`, `README.md`, `Dockerfile` (`EXPOSE 3478/udp 3478/tcp`),
   `docs/specs/handshake-server.md` (scope and deployment sections).

@@ -181,7 +181,7 @@
       "type": "object",
       "properties": {
         "allocations_per_ip": {
-          "description": "Built-in server: most allocations per client IP. A relay-only host needs about three per guest (UDP, TCP, TLS).",
+          "description": "Built-in server: most allocations per client IP (at least 1). A relay-only host needs about three per guest (UDP, TCP, TLS).",
           "type": "integer",
           "format": "uint",
           "default": 64,
@@ -204,7 +204,7 @@
           "default": null
         },
         "kbps_per_allocation": {
-          "description": "Built-in server: relayed traffic per allocation and direction, in kilobits per second. Packets over it are dropped.",
+          "description": "Built-in server: relayed traffic per allocation and direction, in kilobits per second (at least 1). Packets over\nit are dropped; a burst of up to a second's worth, and never less than 64 KiB, passes at once.",
           "type": "integer",
           "format": "uint32",
           "default": 2000,
@@ -216,11 +216,19 @@
           "default": "0.0.0.0:3478"
         },
         "max_allocations": {
-          "description": "Built-in server: most allocations at once.",
+          "description": "Built-in server: most allocations at once (at least 1).",
           "type": "integer",
           "format": "uint",
           "default": 500,
           "minimum": 0
+        },
+        "proxy_protocol_from": {
+          "description": "Built-in server: TCP peers whose PROXY protocol v2 header is believed, as IP ranges: the reverse proxy that\nterminates `turns:`. Empty by default, so no client can claim another address; from any peer outside these\nranges the header is refused.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "relay_ports": {
           "description": "Built-in server: UDP ports for relay addresses, one per allocation, e.g. `\"49160-49200\"`. Setting it starts\nthe built-in server.",

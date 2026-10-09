@@ -71,7 +71,8 @@ coturn it must match its `static-auth-secret`).
 One Docker host runs Caddy (TLS, proxies `/session`, `/turn` and `/ws` to port 8080; keep `/metrics`
 internal) and this server, which is also the TURN relay (publish 3478 over UDP and TCP and the `relay_ports` range;
 `external_ip` is the public address). For `turns:` on 443, Caddy with the caddy-l4 plugin terminates TLS and forwards
-plain TURN with a PROXY protocol header. The [self-hosting guide](https://four43.github.io/handshake/guides/self-hosting/)
+plain TURN with a PROXY protocol header; list Caddy's network in `[turn] proxy_protocol_from` so Handshake believes
+it. The [self-hosting guide](https://four43.github.io/handshake/guides/self-hosting/)
 has the compose file and the Caddy config.
 
 - The container runs as `nonroot`: mount `config.toml` with mode 644 (`chmod 644 config.toml`), or it

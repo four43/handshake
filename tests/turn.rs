@@ -411,6 +411,20 @@ async fn refresh_and_delete() {
 }
 
 #[tokio::test]
+async fn retransmitted_delete_gets_the_same_answer() {
+    let s = start(LOOPBACK).await;
+    let mut c = Client::udp(&s).await;
+    c.relayed().await;
+    // The success response to a Refresh(0) was lost, so the client sends the same transaction again.
+    let req = c.authed(method::REFRESH, |b| b.attr(attr::LIFETIME, &0u32.to_be_bytes()));
+    let one = c.call(req.clone()).await;
+    assert_eq!(Message::parse(&one).unwrap().class, Class::Success);
+    assert_eq!(s.allocations(), 0);
+    assert_eq!(c.call(req).await, one, "not 437");
+    assert_eq!(c.refresh(0).await, Some(437), "a new transaction finds nothing to delete");
+}
+
+#[tokio::test]
 async fn retransmitted_allocate_and_mismatch() {
     let s = start(LOOPBACK).await;
     let mut c = Client::udp(&s).await;
@@ -628,10 +642,12 @@ fn proxy_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
     h
 }
 
+/// Loopback relays, with PROXY headers believed from loopback (the tests' reverse proxy).
+const PROXIED: &str = "allowed_peers = [\"127.0.0.0/8\"]\nproxy_protocol_from = [\"127.0.0.0/8\"]";
+
 #[tokio::test]
 async fn proxy_header_from_a_trusted_proxy() {
-    // 127.0.0.0/8 is in the default trusted_proxies.
-    let s = start(LOOPBACK).await;
+    let s = start(PROXIED).await;
     let client: SocketAddr = "198.51.100.7:4242".parse().unwrap();
     let mut c = Client::tcp(&s).await;
     let mut first = proxy_header(client, s.addr());
@@ -640,7 +656,7 @@ async fn proxy_header_from_a_trusted_proxy() {
     assert_eq!(xaddr(&Message::parse(&c.recv().await).unwrap(), attr::XOR_MAPPED_ADDRESS), client);
 
     // Quotas count the address in the header: one allocation per IP, and the proxy's own address is not that IP.
-    let s = start(&format!("{LOOPBACK}\nallocations_per_ip = 1")).await;
+    let s = start(&format!("{PROXIED}\nallocations_per_ip = 1")).await;
     let mut a = Client::tcp(&s).await;
     a.send(&proxy_header(client, s.addr())).await;
     let resp = a.allocate().await;
@@ -655,18 +671,22 @@ async fn proxy_header_from_a_trusted_proxy() {
 
 #[tokio::test]
 async fn proxy_header_from_anyone_else_is_refused() {
-    let s = start_with(LOOPBACK, "trusted_proxies = []", Tuning::default()).await;
-    let mut c = Client::tcp(&s).await;
-    let mut first = proxy_header("198.51.100.7:4242".parse().unwrap(), s.addr());
-    first.extend_from_slice(&Builder::new(method::BINDING, Class::Request, tx()).finish(None));
-    c.send(&first).await;
-    assert!(c.recv_within(WAIT).await.is_none(), "closed without an answer");
+    // Off by default, even for a peer in trusted_proxies (which covers loopback): that list is for X-Forwarded-For.
+    for (turn, top) in [(LOOPBACK, ""), (r#"proxy_protocol_from = ["10.0.0.0/8"]"#, "")] {
+        let s = start_with(turn, top, Tuning::default()).await;
+        let mut c = Client::tcp(&s).await;
+        let mut first = proxy_header("198.51.100.7:4242".parse().unwrap(), s.addr());
+        first.extend_from_slice(&Builder::new(method::BINDING, Class::Request, tx()).finish(None));
+        c.send(&first).await;
+        assert!(c.recv_within(WAIT).await.is_none(), "closed without an answer ({turn})");
+    }
 }
 
 #[tokio::test]
 async fn tcp_connections_are_capped() {
-    // max_allocations = 1 allows 1 + 256 connections; the next one is closed at once.
-    let s = start(&format!("{LOOPBACK}\nmax_allocations = 1")).await;
+    // max_allocations = 1 allows 1 + 256 connections; the next one is closed at once. (A high per-IP quota, since
+    // every test connection comes from 127.0.0.1.)
+    let s = start(&format!("{LOOPBACK}\nmax_allocations = 1\nallocations_per_ip = 1000")).await;
     let mut open = Vec::new();
     for _ in 0..257 {
         open.push(TcpStream::connect(s.addr()).await.unwrap());
@@ -704,6 +724,84 @@ async fn idle_tcp_connections_are_closed() {
     busy.relayed().await;
     assert!(busy.recv_within(Duration::from_millis(1000)).await.is_none(), "nothing to read…");
     assert_eq!(busy.refresh(600).await, None, "…but the connection with an allocation stays open");
+}
+
+#[tokio::test]
+async fn trickling_bytes_buys_no_time() {
+    let tuning = Tuning { tcp_first_message: Duration::from_millis(300), tcp_idle: Duration::from_millis(600), ..Tuning::default() };
+    let s = start_with(LOOPBACK, "", tuning).await;
+
+    // One byte of a STUN header every 100 ms: each read is quick, but the first message never completes in time.
+    let (mut rd, mut wr) = TcpStream::connect(s.addr()).await.unwrap().into_split();
+    let req = Builder::new(method::BINDING, Class::Request, tx()).finish(None);
+    let trickle = tokio::spawn(async move {
+        for b in &req[..19] {
+            if wr.write_all(&[*b]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let t0 = tokio::time::Instant::now();
+    let mut byte = [0u8; 1];
+    assert!(matches!(timeout(WAIT, rd.read(&mut byte)).await, Ok(Ok(0) | Err(_))), "closed");
+    assert!(t0.elapsed() < Duration::from_millis(1500), "at the first-message deadline, not after 19 bytes");
+    trickle.abort();
+
+    // Binding requests every 200 ms do not keep a connection without an allocation open past tcp_idle.
+    let mut chatty = Client::tcp(&s).await;
+    let t0 = tokio::time::Instant::now();
+    loop {
+        chatty.send(&Builder::new(method::BINDING, Class::Request, tx()).finish(None)).await;
+        if chatty.recv_within(Duration::from_millis(200)).await.is_none() {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "still open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(t0.elapsed() >= Duration::from_millis(400), "open until tcp_idle");
+}
+
+#[tokio::test]
+async fn tcp_connections_per_ip_are_capped() {
+    // allocations_per_ip = 1 allows 1 + 4 connections from one address.
+    let s = start(&format!("{PROXIED}\nallocations_per_ip = 1")).await;
+    let binding = || Builder::new(method::BINDING, Class::Request, tx()).finish(None);
+    let mut open = Vec::new();
+    for _ in 0..5 {
+        let mut c = Client::tcp(&s).await;
+        c.call(binding()).await;
+        open.push(c);
+    }
+    let mut extra = Client::tcp(&s).await;
+    extra.send(&binding()).await;
+    assert!(extra.recv_within(WAIT).await.is_none(), "a sixth from 127.0.0.1: closed");
+
+    // Behind the proxy, the address in the PROXY header is what counts.
+    let mut proxied = Client::tcp(&s).await;
+    let mut first = proxy_header("198.51.100.7:4242".parse().unwrap(), s.addr());
+    first.extend_from_slice(&binding());
+    proxied.send(&first).await;
+    assert!(proxied.recv_within(WAIT).await.is_some(), "another client through the same proxy");
+
+    open.pop();
+    for _ in 0..50 {
+        let mut c = Client::tcp(&s).await;
+        c.send(&binding()).await;
+        if c.recv_within(Duration::from_millis(200)).await.is_some() {
+            return;
+        }
+    }
+    panic!("closing a connection did not free its place");
+}
+
+#[tokio::test]
+async fn zero_limits_are_refused_at_startup() {
+    for bad in ["max_allocations = 0", "allocations_per_ip = 0", "kbps_per_allocation = 0"] {
+        let cfg = config(bad, "");
+        let err = TurnServer::start(&cfg, SECRET.to_vec(), Arc::new(Stats::default())).await.err().expect(bad);
+        assert!(err.to_string().contains("at least 1"), "{bad}: {err}");
+    }
 }
 
 // ---------------------------------------------------------------------------
