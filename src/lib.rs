@@ -1272,6 +1272,21 @@ async fn metrics(State(s): State<Arc<App>>) -> String {
     for (name, kind, value) in counters {
         let _ = writeln!(out, "# TYPE {name} {kind}\n{name} {value}");
     }
+    if s.cfg.turn.as_ref().is_some_and(|t| t.builtin()) {
+        let t = &s.turn_stats;
+        let turn = [
+            ("handshake_turn_allocations", "gauge", t.allocations.load(Ordering::Relaxed)),
+            ("handshake_turn_allocations_total", "counter", t.allocations_total.load(Ordering::Relaxed)),
+            ("handshake_turn_auth_failures_total", "counter", t.auth_failures.load(Ordering::Relaxed)),
+            ("handshake_turn_quota_rejections_total", "counter", t.quota_rejections.load(Ordering::Relaxed)),
+        ];
+        for (name, kind, value) in turn {
+            let _ = writeln!(out, "# TYPE {name} {kind}\n{name} {value}");
+        }
+        let _ = writeln!(out, "# TYPE handshake_turn_relayed_bytes_total counter");
+        let _ = writeln!(out, "handshake_turn_relayed_bytes_total{{direction=\"in\"}} {}", t.bytes_in.load(Ordering::Relaxed));
+        let _ = writeln!(out, "handshake_turn_relayed_bytes_total{{direction=\"out\"}} {}", t.bytes_out.load(Ordering::Relaxed));
+    }
     let inner = s.inner.lock().unwrap();
     let _ = writeln!(out, "# TYPE handshake_rooms gauge");
     for (app, rooms) in &inner.rooms {
