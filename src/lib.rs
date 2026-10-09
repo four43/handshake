@@ -158,18 +158,24 @@ pub struct TurnConfig {
     /// `relay_ports`.
     #[serde(default)]
     pub external_ip: Option<String>,
-    /// Built-in server: most allocations at once.
+    /// Built-in server: most allocations at once (at least 1).
     #[serde(default = "default_max_allocations")]
     pub max_allocations: usize,
-    /// Built-in server: most allocations per client IP. A relay-only host needs about three per guest (UDP, TCP, TLS).
+    /// Built-in server: most allocations per client IP (at least 1). A relay-only host needs about three per guest (UDP, TCP, TLS).
     #[serde(default = "default_allocations_per_ip")]
     pub allocations_per_ip: usize,
-    /// Built-in server: relayed traffic per allocation and direction, in kilobits per second. Packets over it are dropped.
+    /// Built-in server: relayed traffic per allocation and direction, in kilobits per second (at least 1). Packets over
+    /// it are dropped; a burst of up to a second's worth, and never less than 64 KiB, passes at once.
     #[serde(default = "default_kbps_per_allocation")]
     pub kbps_per_allocation: u32,
     /// Built-in server: peer ranges the relay may send to although they are private, loopback or otherwise forbidden.
     #[serde(default)]
     pub allowed_peers: Vec<Cidr>,
+    /// Built-in server: TCP peers whose PROXY protocol v2 header is believed, as IP ranges: the reverse proxy that
+    /// terminates `turns:`. Empty by default, so no client can claim another address; from any peer outside these
+    /// ranges the header is refused.
+    #[serde(default)]
+    pub proxy_protocol_from: Vec<Cidr>,
 }
 
 impl TurnConfig {

@@ -70,9 +70,7 @@ impl Auth {
         let Ok(expiry) = expiry.parse::<u64>() else {
             return NonceCheck::Bad;
         };
-        let want = self.nonce_mac(expiry, client);
-        let same = want.len() == mac.len() && want.bytes().zip(mac.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-        match (same, expiry > now) {
+        match (crate::ct_eq(&self.nonce_mac(expiry, client), mac), expiry > now) {
             (false, _) => NonceCheck::Bad,
             (true, false) => NonceCheck::Stale,
             (true, true) => NonceCheck::Valid,

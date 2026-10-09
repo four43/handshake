@@ -1,8 +1,7 @@
-# Caddy reaches Handshake from the Docker network, so its PROXY headers are trusted.
-trusted_proxies = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
-
 [turn]
 urls = ["turns:turn.test:443?transport=tcp"]
+# Caddy reaches Handshake from the Docker network, so its PROXY headers are believed.
+proxy_protocol_from = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]
 relay_ports = "49160-49169"
 external_ip = "hs"
 allowed_peers = ["172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"]   # the echo peer is on the Docker network

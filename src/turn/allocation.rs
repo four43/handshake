@@ -30,8 +30,9 @@ pub fn v4(ip: IpAddr) -> Option<Ipv4Addr> {
 }
 
 /// Whether the relay may send to `ip`. Relays carry IPv4 only, and never into loopback, private, carrier-grade NAT,
-/// link-local (cloud metadata lives there), multicast, broadcast or reserved space unless `allowed` lists it: otherwise
-/// a TURN user could reach the server's own network.
+/// link-local (cloud metadata lives there), special-use (IETF protocol assignments, documentation, benchmarking, 6to4
+/// relay), multicast, broadcast or reserved space unless `allowed` lists it: otherwise a TURN user could reach the
+/// server's own network, or one that routes those ranges internally (fake-IP proxies use 198.18/15).
 pub fn peer_allowed(ip: IpAddr, allowed: &[Cidr]) -> bool {
     let Some(ip) = v4(ip) else {
         return false;
@@ -39,7 +40,7 @@ pub fn peer_allowed(ip: IpAddr, allowed: &[Cidr]) -> bool {
     if allowed.iter().any(|c| c.contains(IpAddr::V4(ip))) {
         return true;
     }
-    let [a, b, ..] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     let forbidden = ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
@@ -48,13 +49,24 @@ pub fn peer_allowed(ip: IpAddr, allowed: &[Cidr]) -> bool {
         || ip.is_unspecified()
         || a == 0
         || a >= 240
-        || (a == 100 && (64..128).contains(&b));
+        || (a == 100 && (64..128).contains(&b))
+        || (a, b, c) == (192, 0, 0)
+        || (a, b, c) == (192, 0, 2)
+        || (a, b, c) == (192, 88, 99)
+        || (a, b, c) == (198, 51, 100)
+        || (a, b, c) == (203, 0, 113)
+        || (a == 198 && (b == 18 || b == 19));
     !forbidden
 }
 
-/// A token bucket in bytes: a second's worth of burst at `kbps`.
+/// The smallest burst a [`Bucket`] allows: one maximal UDP payload, so a low rate slows traffic down instead of
+/// dropping every packet bigger than a second's worth.
+const MIN_BURST: f64 = 65_535.0;
+
+/// A token bucket in bytes: a second's worth of burst at `kbps`, and never less than [`MIN_BURST`].
 pub struct Bucket {
     rate: f64, // bytes per second
+    burst: f64,
     tokens: f64,
     at: Instant,
 }
@@ -62,13 +74,14 @@ pub struct Bucket {
 impl Bucket {
     pub fn new(kbps: u32, now: Instant) -> Self {
         let rate = kbps as f64 * 125.0;
-        Bucket { rate, tokens: rate, at: now }
+        let burst = rate.max(MIN_BURST);
+        Bucket { rate, burst, tokens: burst, at: now }
     }
 
     /// Spend `bytes` if the bucket holds them.
     pub fn take(&mut self, bytes: usize, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
         self.at = now;
         if self.tokens >= bytes as f64 {
             self.tokens -= bytes as f64;
@@ -102,6 +115,12 @@ impl State {
             permissions: HashMap::new(),
             channels: HashMap::new(),
         }
+    }
+
+    /// False once the lifetime is over, even before the sweeper removes the allocation: it then neither relays nor
+    /// accepts requests.
+    pub fn live(&self, now: Instant) -> bool {
+        self.expires > now
     }
 
     /// Install or refresh a permission for `ip` (port is not part of a permission).
@@ -205,11 +224,15 @@ mod tests {
         for bad in [
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.10", "100.64.0.1", "100.127.255.255",
             "169.254.169.254", "224.0.0.1", "255.255.255.255", "0.0.0.0", "0.1.2.3", "240.0.0.1", "::1", "2001:db8::1",
-            "::ffff:10.0.0.1",
+            "::ffff:10.0.0.1", "192.0.0.8", "192.0.2.1", "192.88.99.1", "198.18.0.5", "198.19.255.255", "198.51.100.1",
+            "203.0.113.5",
         ] {
             assert!(!peer_allowed(ip(bad), &[]), "{bad} must be forbidden");
         }
-        for good in ["8.8.8.8", "203.0.113.5", "100.63.255.255", "100.128.0.1", "172.32.0.1", "::ffff:8.8.4.4"] {
+        for good in [
+            "8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "172.32.0.1", "::ffff:8.8.4.4", "192.0.1.1", "198.17.0.1",
+            "198.20.0.1", "203.0.114.1",
+        ] {
             assert!(peer_allowed(ip(good), &[]), "{good} must be allowed");
         }
         let allowed: Vec<Cidr> = vec!["127.0.0.0/8".parse().unwrap()];
@@ -220,14 +243,33 @@ mod tests {
     #[test]
     fn bucket_bursts_one_second_then_refills() {
         let t0 = Instant::now();
-        let mut b = Bucket::new(8, t0); // 8 kbps = 1000 bytes/s
-        assert!(b.take(600, t0));
-        assert!(b.take(400, t0));
+        let mut b = Bucket::new(800, t0); // 800 kbps = 100 000 bytes/s
+        assert!(b.take(60_000, t0));
+        assert!(b.take(40_000, t0));
         assert!(!b.take(1, t0), "burst used up");
-        assert!(b.take(500, t0 + Duration::from_millis(500)));
+        assert!(b.take(50_000, t0 + Duration::from_millis(500)));
         assert!(!b.take(1, t0 + Duration::from_millis(500)));
-        assert!(!b.take(1001, t0 + Duration::from_secs(10)), "never more than one second's worth");
-        assert!(b.take(1000, t0 + Duration::from_secs(10)));
+        assert!(!b.take(100_001, t0 + Duration::from_secs(10)), "never more than one second's worth");
+        assert!(b.take(100_000, t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn slow_bucket_still_passes_big_packets() {
+        let t0 = Instant::now();
+        let mut b = Bucket::new(8, t0); // 1000 bytes/s, but a burst of one maximal datagram
+        assert!(b.take(1200, t0), "a WebRTC-sized packet fits the burst");
+        assert!(b.take(64_335, t0));
+        assert!(!b.take(1, t0));
+        assert!(b.take(1000, t0 + Duration::from_secs(1)), "then it refills at the rate");
+        assert!(!b.take(1, t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn allocations_die_at_their_lifetime() {
+        let t0 = Instant::now();
+        let st = State::new(DEFAULT_LIFETIME, 1000, t0);
+        assert!(st.live(t0 + DEFAULT_LIFETIME - Duration::from_millis(1)));
+        assert!(!st.live(t0 + DEFAULT_LIFETIME));
     }
 
     #[test]

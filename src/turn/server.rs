@@ -7,10 +7,10 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, RwLock, Weak,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use rand::RngCore;
@@ -19,7 +19,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
     task::{AbortHandle, JoinHandle},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use tracing::{debug, info, warn};
 
@@ -30,7 +30,7 @@ use super::{
     stun::{self, attr, channel_data, method, parse_channel_data, Builder, Class, Frame, Message},
     Stats,
 };
-use crate::{Cidr, Config};
+use crate::{now_unix, Cidr, Config, PortRange};
 
 const RESOLVE_EVERY: Duration = Duration::from_secs(60);
 const TCP_QUEUE: usize = 256;
@@ -38,15 +38,26 @@ const TCP_QUEUE: usize = 256;
 const MAX_TCP_BUFFER: usize = 20 + 65_535 + 4;
 /// TCP connections allowed beyond one per allocation: clients still authenticating, and Binding-only (STUN) clients.
 const SPARE_TCP_CONNECTIONS: usize = 256;
+/// TCP connections one client IP may have beyond `allocations_per_ip`.
+const SPARE_TCP_PER_IP: usize = 4;
+/// How long a deleted allocation's last response is kept for a retransmitted Refresh: RFC 8489's 39.5 s
+/// transaction timeout, rounded up.
+const RETRANSMIT_WINDOW: Duration = Duration::from_secs(40);
+/// A relay socket's receive buffer. A datagram that fills it may have been cut short, so it is dropped: peers can
+/// send at most `RELAY_BUFFER - 1` bytes (WebRTC stays under about 1500).
+const RELAY_BUFFER: usize = 4096;
+/// How long a closing TCP connection may take to write out what is queued for it.
+const TCP_FLUSH: Duration = Duration::from_secs(1);
 
 /// Timings the tests shorten. [`Tuning::default`] is what the server runs with.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct Tuning {
     pub nonce_secs: u64,
-    /// A TCP connection must complete its first message within this.
+    /// A TCP connection must complete its first message within this of opening, however slowly the bytes arrive.
     pub tcp_first_message: Duration,
-    /// A TCP connection without an allocation is closed after this long without a message.
+    /// A TCP connection without an allocation is closed this long after it opened, whatever it sends: Binding
+    /// requests do not keep it alive. With an allocation it stays open until that is gone.
     pub tcp_idle: Duration,
     pub sweep_every: Duration,
 }
@@ -82,6 +93,15 @@ impl TurnServer {
         let range = tc.relay_ports.ok_or_else(|| invalid("[turn] relay_ports is missing"))?;
         let external = tc.external_ip.clone().ok_or_else(|| invalid("[turn] external_ip is required with relay_ports"))?;
         let listen: SocketAddr = tc.listen.parse().map_err(|_| invalid("[turn] listen is not an address and port"))?;
+        for (name, value) in [
+            ("max_allocations", tc.max_allocations),
+            ("allocations_per_ip", tc.allocations_per_ip),
+            ("kbps_per_allocation", tc.kbps_per_allocation as usize),
+        ] {
+            if value == 0 {
+                return Err(invalid(&format!("[turn] {name} must be at least 1")));
+            }
+        }
         let external_now = resolve(&external).await?;
         let (udp, tcp) = bind_pair(listen).await?;
         let addr = udp.local_addr()?;
@@ -93,13 +113,16 @@ impl TurnServer {
             allocations_per_ip: tc.allocations_per_ip,
             kbps: tc.kbps_per_allocation,
             allowed_peers: tc.allowed_peers.clone(),
-            trusted: cfg.trusted_proxies.clone(),
+            proxies: tc.proxy_protocol_from.clone(),
             tuning: tuning.clone(),
-            external: Mutex::new(external_now),
+            external: AtomicU32::new(external_now.into()),
             udp: Arc::new(udp),
-            table: Mutex::new(Table { allocs: HashMap::new(), by_port: HashMap::new(), ports: PortPool::new(range) }),
+            range,
+            table: RwLock::new(Table { allocs: HashMap::new(), by_port: HashMap::new(), deleted: HashMap::new() }),
+            ports: Mutex::new(PortPool::new(range)),
             stats,
             next_tcp: AtomicU64::new(1),
+            tcp_per_ip: Mutex::new(HashMap::new()),
             shutdown: tokio::sync::watch::channel(false).0,
         });
 
@@ -126,7 +149,7 @@ impl Drop for TurnServer {
         for t in &self.tasks {
             t.abort();
         }
-        let mut table = self.shared.table.lock().unwrap();
+        let mut table = self.shared.table.write().unwrap();
         let keys: Vec<Key> = table.allocs.keys().copied().collect();
         for key in keys {
             self.shared.remove(&mut table, key);
@@ -167,10 +190,8 @@ async fn resolver(shared: Weak<Shared>, host: String) {
         let Some(sh) = shared.upgrade() else { return };
         match resolve(&host).await {
             Ok(ip) => {
-                let mut ext = sh.external.lock().unwrap();
-                if *ext != ip {
+                if sh.external.swap(ip.into(), Ordering::Relaxed) != u32::from(ip) {
                     info!(external_ip = %ip, host, "TURN external address changed");
-                    *ext = ip;
                 }
             }
             Err(e) => warn!(host, error = %e, "cannot resolve TURN external_ip; keeping the last address"),
@@ -188,19 +209,31 @@ async fn sweeper(shared: Weak<Shared>) {
         tick.tick().await;
         let Some(sh) = shared.upgrade() else { return };
         let now = Instant::now();
-        let mut table = sh.table.lock().unwrap();
-        let mut expired = Vec::new();
-        for (key, a) in &table.allocs {
-            let mut st = a.state.lock().unwrap();
-            if st.expires <= now {
-                expired.push(*key);
-            } else {
-                st.expire(now);
+        // Find the work under the read lock, so relaying carries on meanwhile.
+        let expired: Vec<Key> = {
+            let table = sh.table.read().unwrap();
+            let mut expired = Vec::new();
+            for (key, a) in &table.allocs {
+                let mut st = a.state.lock().unwrap();
+                if st.live(now) {
+                    st.expire(now);
+                } else {
+                    expired.push(*key);
+                }
+            }
+            if expired.is_empty() && table.deleted.is_empty() {
+                continue;
+            }
+            expired
+        };
+        let mut table = sh.table.write().unwrap();
+        for key in expired {
+            // Gone already, or replaced by a new allocation, between the two locks: leave it.
+            if table.allocs.get(&key).is_some_and(|a| !a.state.lock().unwrap().live(now)) {
+                sh.remove(&mut table, key);
             }
         }
-        for key in expired {
-            sh.remove(&mut table, key);
-        }
+        table.deleted.retain(|_, (_, _, at)| now.duration_since(*at) < RETRANSMIT_WINDOW);
     }
 }
 
@@ -214,13 +247,20 @@ struct Shared {
     allocations_per_ip: usize,
     kbps: u32,
     allowed_peers: Vec<Cidr>,
-    trusted: Vec<Cidr>,
+    /// `[turn].proxy_protocol_from`: who may send a PROXY header.
+    proxies: Vec<Cidr>,
     tuning: Tuning,
-    external: Mutex<Ipv4Addr>,
+    /// `external_ip`, as a `u32`: read for every relayed packet, written by the resolver.
+    external: AtomicU32,
     udp: Arc<UdpSocket>,
-    table: Mutex<Table>, // lock order: table, then an allocation's state
+    range: PortRange,
+    // Lock order: table, then ports or an allocation's state. Relaying only ever takes the table's read lock.
+    table: RwLock<Table>,
+    ports: Mutex<PortPool>,
     stats: Arc<Stats>,
     next_tcp: AtomicU64,
+    /// Open TCP connections per client IP.
+    tcp_per_ip: Mutex<HashMap<IpAddr, usize>>,
     /// Set when the server is dropped, so TCP connections end too.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -228,7 +268,8 @@ struct Shared {
 struct Table {
     allocs: HashMap<Key, Arc<Alloc>>,
     by_port: HashMap<u16, Arc<Alloc>>,
-    ports: PortPool,
+    /// Allocations a Refresh deleted lately: the transaction and its response, for a retransmission.
+    deleted: HashMap<Key, (stun::TxId, Vec<u8>, Instant)>,
 }
 
 /// What identifies a client's allocation: its UDP address, or its TCP connection.
@@ -293,10 +334,6 @@ fn canon(addr: SocketAddr) -> SocketAddr {
     v4(addr.ip()).map_or(addr, |ip| SocketAddr::new(IpAddr::V4(ip), addr.port()))
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 fn random_tx() -> stun::TxId {
     let mut tx = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut tx);
@@ -309,15 +346,30 @@ fn random_tx() -> stun::TxId {
 
 impl Shared {
     fn alloc(&self, key: Key) -> Option<Arc<Alloc>> {
-        self.table.lock().unwrap().allocs.get(&key).cloned()
+        self.table.read().unwrap().allocs.get(&key).cloned()
+    }
+
+    fn external(&self) -> Ipv4Addr {
+        self.external.load(Ordering::Relaxed).into()
     }
 
     fn remove(&self, table: &mut Table, key: Key) {
         if let Some(a) = table.allocs.remove(&key) {
             table.by_port.remove(&a.port);
-            table.ports.release(a.port);
+            self.ports.lock().unwrap().release(a.port);
             self.stats.allocations.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Count a TCP connection against its client IP, or `None` when that IP has as many as it may.
+    fn claim_tcp(self: &Arc<Self>, ip: IpAddr) -> Option<TcpClaim> {
+        let mut open = self.tcp_per_ip.lock().unwrap();
+        let n = open.entry(ip).or_insert(0);
+        if *n >= self.allocations_per_ip + SPARE_TCP_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(TcpClaim { shared: self.clone(), ip })
     }
 
     /// A STUN message from a client.
@@ -398,16 +450,6 @@ impl Shared {
 
     fn allocate(self: &Arc<Self>, msg: &Message, ctx: &Ctx, username: String, key: [u8; 16]) -> Vec<u8> {
         let reply = Reply { msg, key: &key };
-        let mut table = self.table.lock().unwrap();
-        if let Some(existing) = table.allocs.get(&ctx.key) {
-            // A retransmission of the request that made it gets the same answer; anything else is a mismatch.
-            if let Some((tx, resp)) = &existing.state.lock().unwrap().last {
-                if *tx == msg.tx {
-                    return resp.clone();
-                }
-            }
-            return reply.error(437, "Allocation Mismatch");
-        }
         match msg.get(attr::REQUESTED_TRANSPORT) {
             Some([17, ..]) => {}
             Some(_) => return reply.error(442, "Unsupported Transport Protocol"),
@@ -422,30 +464,25 @@ impl Shared {
             Some([r, ..]) if r & 0x80 != 0 => return reply.error(508, "Insufficient Capacity"),
             Some(_) => true,
         };
-        let same_ip = table.allocs.values().filter(|a| a.client.ip() == ctx.client.ip()).count();
-        if same_ip >= self.allocations_per_ip {
-            self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
-            return reply.error(486, "Allocation Quota Reached");
+        // A first look under the read lock, so a refused request costs no socket.
+        if let Err(resp) = self.may_allocate(&self.table.read().unwrap(), msg, ctx, &reply) {
+            return resp;
         }
-        if table.allocs.len() >= self.max_allocations {
-            self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
-            return reply.error(508, "Insufficient Capacity");
-        }
-        let Some((sock, port)) = table.ports.bind(even) else {
+        // Binding may try every port in the range: do it without the table, which every relayed packet reads.
+        let Some((sock, port)) = self.ports.lock().unwrap().bind(even) else {
             self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
             return reply.error(508, "Insufficient Capacity");
         };
         let relay = match UdpSocket::from_std(sock) {
             Ok(r) => Arc::new(r),
             Err(_) => {
-                table.ports.release(port);
+                self.ports.lock().unwrap().release(port);
                 return reply.error(508, "Insufficient Capacity");
             }
         };
         let lifetime = allocation::lifetime(lifetime_attr(msg));
-        let external = *self.external.lock().unwrap();
         let resp = Builder::new(method::ALLOCATE, Class::Success, msg.tx)
-            .xor_addr(attr::XOR_RELAYED_ADDRESS, SocketAddr::new(external.into(), port))
+            .xor_addr(attr::XOR_RELAYED_ADDRESS, SocketAddr::new(self.external().into(), port))
             .xor_addr(attr::XOR_MAPPED_ADDRESS, ctx.client)
             .attr(attr::LIFETIME, &(lifetime.as_secs() as u32).to_be_bytes())
             .finish(Some(&key));
@@ -462,6 +499,16 @@ impl Shared {
         });
         let reader = tokio::spawn(relay_reader(Arc::downgrade(&alloc), relay, self.stats.clone()));
         *alloc.reader.lock().unwrap() = Some(reader.abort_handle());
+
+        let mut table = self.table.write().unwrap();
+        // Again under the write lock: another request may have got in between. Dropping `alloc` stops its reader.
+        if let Err(resp) = self.may_allocate(&table, msg, ctx, &reply) {
+            self.ports.lock().unwrap().release(port);
+            return resp;
+        }
+        // An expired allocation the sweeper has not reached yet no longer counts: replace it.
+        self.remove(&mut table, ctx.key);
+        table.deleted.remove(&ctx.key);
         table.allocs.insert(ctx.key, alloc.clone());
         table.by_port.insert(port, alloc);
         self.stats.allocations.fetch_add(1, Ordering::Relaxed);
@@ -469,9 +516,37 @@ impl Shared {
         resp
     }
 
-    /// The caller's allocation, or the error to answer with: 437 without one, 441 when it belongs to another username.
+    /// Whether `ctx` may get a new allocation: `Err` with the response when it has a live one already (a
+    /// retransmission of the request that made it gets the same answer; anything else is a mismatch) or a quota is full.
+    fn may_allocate(&self, table: &Table, msg: &Message, ctx: &Ctx, reply: &Reply) -> Result<(), Vec<u8>> {
+        let now = Instant::now();
+        if let Some(existing) = table.allocs.get(&ctx.key) {
+            let st = existing.state.lock().unwrap();
+            if st.live(now) {
+                return Err(match &st.last {
+                    Some((tx, resp)) if *tx == msg.tx => resp.clone(),
+                    _ => reply.error(437, "Allocation Mismatch"),
+                });
+            }
+        }
+        let same_ip = table.allocs.iter().filter(|(k, a)| **k != ctx.key && a.client.ip() == ctx.client.ip()).count();
+        if same_ip >= self.allocations_per_ip {
+            self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
+            return Err(reply.error(486, "Allocation Quota Reached"));
+        }
+        let others = table.allocs.len() - usize::from(table.allocs.contains_key(&ctx.key));
+        if others >= self.max_allocations {
+            self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
+            return Err(reply.error(508, "Insufficient Capacity"));
+        }
+        Ok(())
+    }
+
+    /// The caller's allocation, or the error to answer with: 437 without a live one, 441 when it belongs to another
+    /// username.
     fn own_alloc(&self, ctx: &Ctx, username: &str, reply: &Reply) -> Result<Arc<Alloc>, Vec<u8>> {
-        let alloc = self.alloc(ctx.key).ok_or_else(|| reply.error(437, "Allocation Mismatch"))?;
+        let alloc = self.alloc(ctx.key).filter(|a| a.state.lock().unwrap().live(Instant::now()));
+        let alloc = alloc.ok_or_else(|| reply.error(437, "Allocation Mismatch"))?;
         if alloc.username != username {
             return Err(reply.error(441, "Wrong Credentials"));
         }
@@ -479,15 +554,23 @@ impl Shared {
     }
 
     fn refresh(&self, msg: &Message, ctx: &Ctx, username: &str, reply: &Reply) -> Vec<u8> {
+        // A retransmitted Refresh that deleted the allocation gets the same answer, not 437.
+        if let Some((tx, resp, _)) = self.table.read().unwrap().deleted.get(&ctx.key) {
+            if *tx == msg.tx {
+                return resp.clone();
+            }
+        }
         let alloc = match self.own_alloc(ctx, username, reply) {
             Ok(a) => a,
             Err(resp) => return resp,
         };
         let requested = lifetime_attr(msg);
         if requested == Some(0) {
-            let mut table = self.table.lock().unwrap();
+            let resp = reply.success(&[(attr::LIFETIME, &0u32.to_be_bytes())]);
+            let mut table = self.table.write().unwrap();
             self.remove(&mut table, ctx.key);
-            return reply.success(&[(attr::LIFETIME, &0u32.to_be_bytes())]);
+            table.deleted.insert(ctx.key, (msg.tx, resp.clone(), Instant::now()));
+            return resp;
         }
         let mut st = alloc.state.lock().unwrap();
         if let Some((tx, resp)) = &st.last {
@@ -507,9 +590,7 @@ impl Shared {
         if peer.is_ipv6() && v4(peer.ip()).is_none() {
             return Err((443, "Peer Address Family Mismatch"));
         }
-        // Never hold `external` and `table` together: allocate() takes them in the other order.
-        let external = *self.external.lock().unwrap();
-        let own = v4(peer.ip()) == Some(external) && self.table.lock().unwrap().ports.contains(peer.port());
+        let own = v4(peer.ip()) == Some(self.external()) && (self.range.first..=self.range.last).contains(&peer.port());
         if own || peer_allowed(peer.ip(), &self.allowed_peers) {
             Ok(())
         } else {
@@ -570,7 +651,7 @@ impl Shared {
         {
             let now = Instant::now();
             let mut st = alloc.state.lock().unwrap();
-            if !st.permitted(peer.ip(), now) || !st.up.take(data.len(), now) {
+            if !st.live(now) || !st.permitted(peer.ip(), now) || !st.up.take(data.len(), now) {
                 return;
             }
         }
@@ -585,7 +666,7 @@ impl Shared {
             let now = Instant::now();
             let mut st = alloc.state.lock().unwrap();
             match st.channel_peer(ch, now) {
-                Some(peer) if st.up.take(data.len(), now) => peer,
+                Some(peer) if st.live(now) && st.up.take(data.len(), now) => peer,
                 _ => return,
             }
         };
@@ -597,9 +678,9 @@ impl Shared {
     /// on `external_ip` is ever sent to: permissions are per IP, so a permission for another allocation's relay address
     /// would otherwise reach every service on this host.
     fn relay_out(&self, alloc: &Alloc, peer: SocketAddr, data: &[u8]) {
-        let external = *self.external.lock().unwrap();
+        let external = self.external();
         if v4(peer.ip()) == Some(external) {
-            let target = self.table.lock().unwrap().by_port.get(&peer.port()).cloned();
+            let target = self.table.read().unwrap().by_port.get(&peer.port()).cloned();
             if let Some(target) = target {
                 self.stats.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
                 on_peer_data(&target, SocketAddr::new(external.into(), alloc.port), data, &self.stats);
@@ -642,7 +723,7 @@ fn on_peer_data(alloc: &Alloc, from: SocketAddr, data: &[u8], stats: &Stats) {
     let channel = {
         let now = Instant::now();
         let mut st = alloc.state.lock().unwrap();
-        if !st.permitted(from.ip(), now) || !st.down.take(data.len(), now) {
+        if !st.live(now) || !st.permitted(from.ip(), now) || !st.down.take(data.len(), now) {
             return;
         }
         st.peer_channel(from, now)
@@ -659,11 +740,14 @@ fn on_peer_data(alloc: &Alloc, from: SocketAddr, data: &[u8], stats: &Stats) {
 }
 
 async fn relay_reader(alloc: Weak<Alloc>, relay: Arc<UdpSocket>, stats: Arc<Stats>) {
-    let mut buf = vec![0u8; 65_536];
+    let mut buf = vec![0u8; RELAY_BUFFER];
     loop {
         // Errors here are ICMP reports for earlier sends (a peer port that was closed); keep reading.
         let Ok((n, from)) = relay.recv_from(&mut buf).await else { continue };
         let Some(alloc) = alloc.upgrade() else { return };
+        if n == RELAY_BUFFER {
+            continue; // possibly truncated
+        }
         on_peer_data(&alloc, from, &buf[..n], &stats);
     }
 }
@@ -711,6 +795,24 @@ async fn tcp_loop(sh: Arc<Shared>, listener: TcpListener) {
     }
 }
 
+/// One open TCP connection counted against its client IP; dropping it gives the count back.
+struct TcpClaim {
+    shared: Arc<Shared>,
+    ip: IpAddr,
+}
+
+impl Drop for TcpClaim {
+    fn drop(&mut self) {
+        let mut open = self.shared.tcp_per_ip.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64) {
     let _ = stream.set_nodelay(true);
     let (mut rd, mut wr) = stream.into_split();
@@ -724,10 +826,15 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
     });
     let key = Key::Tcp(id);
     let mut ctx = Ctx { key, client: peer, sink: Sink::Tcp(tx) };
-    // Only a trusted proxy may say who the client is, and it may also connect without saying (LAN clients).
-    let mut proxy_pending = sh.trusted.iter().any(|c| c.contains(peer.ip()));
+    // Only `proxy_protocol_from` may say who the client is, and it may also connect without saying (LAN clients).
+    let mut proxy_pending = sh.proxies.iter().any(|c| c.contains(peer.ip()));
+    // Counted against the client once it is known: the socket peer, or the PROXY header's source.
+    let mut claim: Option<TcpClaim> = None;
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut first = true;
+    // Deadlines run from when the connection opened, not from the last read: trickling bytes buys no time.
+    let opened = tokio::time::Instant::now();
+    let mut deadline = opened + sh.tuning.tcp_first_message;
     let mut shutdown = sh.shutdown.subscribe();
     'conn: loop {
         loop {
@@ -748,12 +855,24 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
                 }
                 proxy_pending = false;
             }
+            if claim.is_none() {
+                match sh.claim_tcp(ctx.client.ip()) {
+                    Some(c) => claim = Some(c),
+                    None => {
+                        debug!(client = %ctx.client, "too many TCP connections from one address");
+                        break 'conn;
+                    }
+                }
+            }
             match stun::frame(&buf) {
                 Frame::Need => break,
                 Frame::Bad => break 'conn,
                 Frame::Complete(n) => {
                     let frame: Vec<u8> = buf.drain(..n).collect();
-                    first = false;
+                    if first {
+                        first = false;
+                        deadline = opened + sh.tuning.tcp_idle;
+                    }
                     if frame[0] >> 6 == 0 {
                         sh.on_stun(&ctx, &frame);
                     } else {
@@ -765,10 +884,9 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
         if buf.len() > MAX_TCP_BUFFER {
             break;
         }
-        let wait = if first { sh.tuning.tcp_first_message } else { sh.tuning.tcp_idle };
         buf.reserve(4096);
         let read = tokio::select! {
-            read = timeout(wait, rd.read_buf(&mut buf)) => read,
+            read = timeout_at(deadline, rd.read_buf(&mut buf)) => read,
             _ = shutdown.wait_for(|down| *down) => break,
         };
         match read {
@@ -776,15 +894,19 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
             Ok(Ok(_)) => {}
             Err(_) if first => break,
             Err(_) => {
-                // Idle: fine while the connection holds an allocation, which the sweeper ends when it expires.
+                // Fine while the connection holds an allocation, which the sweeper ends when it expires.
                 if sh.alloc(key).is_none() {
                     break;
                 }
+                deadline = tokio::time::Instant::now() + sh.tuning.tcp_idle;
             }
         }
     }
-    let mut table = sh.table.lock().unwrap();
-    sh.remove(&mut table, key);
-    drop(table);
-    writer.abort();
+    sh.remove(&mut sh.table.write().unwrap(), key);
+    // Let the writer send what is queued (the answer to a last request) once every sender is gone, but not for long.
+    drop(ctx);
+    let abort = writer.abort_handle();
+    if timeout(TCP_FLUSH, writer).await.is_err() {
+        abort.abort();
+    }
 }
