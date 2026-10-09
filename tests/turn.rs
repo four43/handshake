@@ -640,6 +640,29 @@ async fn proxy_header_from_anyone_else_is_refused() {
 }
 
 #[tokio::test]
+async fn tcp_connections_are_capped() {
+    // max_allocations = 1 allows 1 + 256 connections; the next one is closed at once.
+    let s = start(&format!("{LOOPBACK}\nmax_allocations = 1")).await;
+    let mut open = Vec::new();
+    for _ in 0..257 {
+        open.push(TcpStream::connect(s.addr()).await.unwrap());
+    }
+    let mut extra = Client::tcp(&s).await;
+    extra.send(&Builder::new(method::BINDING, Class::Request, tx()).finish(None)).await;
+    assert!(extra.recv_within(WAIT).await.is_none(), "over the cap: closed");
+    drop(open);
+    // Closed connections free their slots: a new connection is answered once the server has noticed.
+    for _ in 0..50 {
+        let mut c = Client::tcp(&s).await;
+        c.send(&Builder::new(method::BINDING, Class::Request, tx()).finish(None)).await;
+        if c.recv_within(Duration::from_millis(200)).await.is_some() {
+            return;
+        }
+    }
+    panic!("no slot came free");
+}
+
+#[tokio::test]
 async fn idle_tcp_connections_are_closed() {
     let tuning = Tuning { tcp_first_message: Duration::from_millis(200), tcp_idle: Duration::from_millis(400), ..Tuning::default() };
     let s = start_with(LOOPBACK, "", tuning).await;

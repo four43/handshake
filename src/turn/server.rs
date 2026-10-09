@@ -36,6 +36,8 @@ const RESOLVE_EVERY: Duration = Duration::from_secs(60);
 const TCP_QUEUE: usize = 256;
 /// The most a TCP client may have buffered: one maximal STUN message or ChannelData frame.
 const MAX_TCP_BUFFER: usize = 20 + 65_535 + 4;
+/// TCP connections allowed beyond one per allocation: clients still authenticating, and Binding-only (STUN) clients.
+const SPARE_TCP_CONNECTIONS: usize = 256;
 
 /// Timings the tests shorten. [`Tuning::default`] is what the server runs with.
 #[doc(hidden)]
@@ -501,7 +503,9 @@ impl Shared {
         if peer.is_ipv6() && v4(peer.ip()).is_none() {
             return Err((443, "Peer Address Family Mismatch"));
         }
-        let own = v4(peer.ip()) == Some(*self.external.lock().unwrap()) && self.table.lock().unwrap().ports.contains(peer.port());
+        // Copy the address out first: holding the `external` lock while taking `table` would invert allocate()'s order.
+        let external = *self.external.lock().unwrap();
+        let own = v4(peer.ip()) == Some(external) && self.table.lock().unwrap().ports.contains(peer.port());
         if own || peer_allowed(peer.ip(), &self.allowed_peers) {
             Ok(())
         } else {
@@ -676,10 +680,27 @@ async fn udp_loop(sh: Arc<Shared>) {
 }
 
 async fn tcp_loop(sh: Arc<Shared>, listener: TcpListener) {
+    // Every connection holds a socket and a task until it times out, so cap them: a flood must not exhaust file
+    // descriptors for the HTTP side and the relay sockets.
+    let slots = Arc::new(tokio::sync::Semaphore::new(sh.max_allocations + SPARE_TCP_CONNECTIONS));
     loop {
-        let Ok((stream, peer)) = listener.accept().await else { continue };
+        let (stream, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(_) => {
+                // Out of file descriptors, most likely: back off instead of spinning.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue; // dropping the stream closes it
+        };
         let id = sh.next_tcp.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(tcp_conn(sh.clone(), stream, canon(peer), id));
+        let sh = sh.clone();
+        tokio::spawn(async move {
+            tcp_conn(sh, stream, canon(peer), id).await;
+            drop(slot);
+        });
     }
 }
 
