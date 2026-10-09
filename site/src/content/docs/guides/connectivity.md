@@ -9,15 +9,15 @@ Handshake only sets up connections. Game data goes straight between the host and
 
 Players on cellular networks (carrier-grade NAT), strict corporate or school Wi-Fi, or guest Wi-Fi with client isolation often cannot connect to each other directly, even when they sit in the same room. A TURN server relays their traffic instead. Expect roughly 10 to 20% of internet sessions to need it. Without TURN those players simply fail to connect.
 
-Run [coturn](https://github.com/coturn/coturn) next to Handshake (see [Self-hosting](/guides/self-hosting/)). Handshake never relays game traffic itself; it only hands out short-lived TURN credentials.
+Handshake runs the TURN relay itself (see [Self-hosting](/guides/self-hosting/#turn)): one container, no coturn. It hands out short-lived TURN credentials over `/turn` and checks them when browsers use its relay.
 
 ## Turning it on
 
 Three things must line up:
 
-1. A `[turn]` section in the server config with the URLs to offer and the credential lifetime.
+1. A `[turn]` section in the server config with the URLs to offer, `relay_ports` and `external_ip`.
 2. `turn = true` on the app.
-3. The `TURN_SECRET` environment variable, equal to coturn's `static-auth-secret`.
+3. The relay ports and 3478 (UDP and TCP) reachable from the internet.
 
 ```toml
 [turn]
@@ -27,26 +27,27 @@ urls = [
   "turn:turn.example.com:3478?transport=tcp",
   "turns:turn.example.com:443?transport=tcp",
 ]
-ttl_secs = 3600
+relay_ports = "49160-49200"
+external_ip = "203.0.113.10"
 
 [apps.my-game]
 origins = ["https://you.github.io"]
 turn = true
 ```
 
-Offer `turn:` over both UDP and TCP on 3478, plus `turns:` (TLS) on 443 for networks that block everything but HTTPS. See the [config reference](/reference/config/).
+Offer `turn:` over both UDP and TCP on 3478, plus `turns:` (TLS) on 443 for networks that block everything but HTTPS. Handshake does not do TLS itself: your reverse proxy terminates it and forwards plain TURN (see [TURN over TLS on 443 with Caddy](/guides/self-hosting/#turn-over-tls-on-443-with-caddy)). See the [config reference](/reference/config/) for every key.
 
-`POST /session` tells the client whether TURN is available (`"turn": true` only when all three are in place). If the app has `turn = true` but the server has no `[turn]` section or no `TURN_SECRET`, `/session` reports `"turn": false` and `/turn` answers `503 turn_unconfigured`; the server logs a warning at startup when `[turn]` is set without `TURN_SECRET`.
+`POST /session` tells the client whether TURN is available (`"turn": true` when the app has `turn = true` and `[turn]` is set). Without `relay_ports`, Handshake only mints credentials for an external coturn and needs `TURN_SECRET`; if that is missing, `/session` reports `"turn": false`, `/turn` answers `503 turn_unconfigured`, and the server logs a warning at startup.
 
 ## Credentials
 
-Credentials follow coturn's `use-auth-secret` (TURN REST API) scheme:
+Credentials follow coturn's `use-auth-secret` (TURN REST API) scheme, so the same ones work with the built-in relay and with coturn:
 
 - **Username:** `<expiry unix time>:<app id>`, for example `1767225600:my-game`.
-- **Credential:** base64 of HMAC-SHA1 over the username, keyed with `TURN_SECRET`.
+- **Credential:** base64 of HMAC-SHA1 over the username, keyed with the TURN secret (`TURN_SECRET`, or one Handshake makes up at startup).
 - **Lifetime:** `ttl_secs`, default 1 hour.
 
-coturn checks them on its own; there is no call back to Handshake. Because the app ID is in the username, coturn's logs attribute relay usage per app, and its quotas (`user-quota`, `total-quota`, `max-bps`) can limit it.
+The relay accepts a username only while it has not expired and only for an app with `turn = true`. Because the app ID is in the username, quotas and logs can be told apart per app.
 
 The JS client fetches credentials from `POST /turn` before creating or joining a room, renews them about a minute before they expire, and pushes the new ones into open peer connections. A failed fetch is tried once more. If it fails again, the client logs a warning and carries on without TURN, except with `relayUnlessNearby` (below): then `createRoom` and `joinRoom` reject with `no_turn`, since players who are not nearby could never connect. See the [HTTP API](/reference/http/).
 

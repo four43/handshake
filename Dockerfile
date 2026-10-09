@@ -19,7 +19,7 @@ COPY --from=build /src/target/release/handshake /usr/local/bin/handshake
 
 ENV CONFIG=/etc/handshake/config.toml \
     RUST_LOG=info
-EXPOSE 8080
+EXPOSE 8080 3478/udp 3478/tcp
 USER nonroot
 
 # distroless has no curl; the binary probes its own /healthz.

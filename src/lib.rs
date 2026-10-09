@@ -1646,6 +1646,9 @@ mod tests {
         assert_eq!(tp.list, ListMode::Hidden);
         assert_eq!(cfg.apps["pig-pens"].list, ListMode::All);
         assert_eq!(cfg.limits.grace_secs, 30);
+        let turn = cfg.turn.unwrap();
+        assert!(turn.builtin());
+        assert_eq!((turn.relay_ports, turn.external_ip.as_deref()), (Some(PortRange { first: 49160, last: 49200 }), Some("203.0.113.10")));
     }
 
     // ---- session tokens -------------------------------------------------

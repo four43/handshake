@@ -8,8 +8,8 @@
 
 A small WebRTC signaling server and room registry for four43.com browser games, plus the browser
 client every game uses (`client/handshake.js`). It matches players into rooms and relays connection
-setup; game data then goes peer to peer (host to each guest), through a TURN relay when it must.
-The server never sees game data. `docs/specs/handshake-server.md` is the design.
+setup; game data then goes peer to peer (host to each guest), through the server's built-in TURN relay
+when it must. The server never sees inside game data. `docs/specs/handshake-server.md` is the design.
 
 <p align="center">
   <img src="docs/handshake.jpg" alt="Meme: Two arms embrace, one 'You', one 'Your Friend' over multiplayer games" height="300px">
@@ -54,19 +54,25 @@ joined?.on('peer', host => host.send({ hello: 'host' }, { reliable: true }));
 [quickstart](https://four43.github.io/handshake/quickstart/) walks through this with error handling, and
 [self-hosting](https://four43.github.io/handshake/guides/self-hosting/) covers TLS, TURN and production config.
 
+Players on cellular or strict corporate Wi-Fi need the TURN relay. Turn it on with `relay_ports` and `external_ip` under
+`[turn]`, publish 3478 (UDP and TCP) and the relay ports, and set `turn = true` on the app; see
+[connectivity](https://four43.github.io/handshake/guides/connectivity/).
+
 ## Configure
 
 `config.example.toml` documents every key ([config reference](https://four43.github.io/handshake/reference/config/)).
 Each game is an `[apps.<id>]` entry with its allowed origins and limits; `list = "none"` makes its rooms joinable
 by code only. Secrets come from the environment, never the file: `SESSION_SECRET` (required, 32+ characters),
-`SESSION_SECRET_PREV` (optional, for rotation), `TURN_SECRET` (must match coturn's `static-auth-secret`).
+`SESSION_SECRET_PREV` (optional, for rotation), `TURN_SECRET` (optional with the built-in TURN server; for an external
+coturn it must match its `static-auth-secret`).
 
 ## Deploy
 
 One Docker host runs Caddy (TLS, proxies `/session`, `/turn` and `/ws` to port 8080; keep `/metrics`
-internal), this server and coturn (`network_mode: host`, a narrow relay port range, `external-ip`
-behind NAT). The [self-hosting guide](https://four43.github.io/handshake/guides/self-hosting/) has the
-compose file.
+internal) and this server, which is also the TURN relay (publish 3478 over UDP and TCP and the `relay_ports` range;
+`external_ip` is the public address). For `turns:` on 443, Caddy with the caddy-l4 plugin terminates TLS and forwards
+plain TURN with a PROXY protocol header. The [self-hosting guide](https://four43.github.io/handshake/guides/self-hosting/)
+has the compose file and the Caddy config.
 
 - The container runs as `nonroot`: mount `config.toml` with mode 644 (`chmod 644 config.toml`), or it
   cannot read it.
@@ -84,8 +90,10 @@ compose file.
 ```bash
 scripts/test.sh                 # server: unit + socket integration tests (cargo runs in Docker)
 cd client && npm test           # client: unit tests against fakes (Node 20+)
-cd client && npm run e2e        # client + server: two Chromium pages, real WebRTC (needs Docker;
-                                # first time: npm install && npx playwright install chromium)
+cd client && npm run e2e        # client + server: two Chromium pages, real WebRTC, direct and through
+                                # the TURN relay (needs Docker; first time: npm install && npx playwright install chromium)
+scripts/turn-interop.sh         # coturn's turnutils_uclient against the built-in TURN server (needs Docker)
+scripts/turns-caddy/check.sh    # turns: on 443 through Caddy + caddy-l4, as the self-hosting guide sets it up
 ```
 
 ### Run from source
