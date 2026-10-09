@@ -1,5 +1,6 @@
 //! Built-in TURN server tests: run it in-process on 127.0.0.1 and drive it with a small TURN client over real UDP
-//! and TCP sockets. Relay addresses are 127.0.0.1, so most configs allow loopback peers.
+//! and TCP sockets. The relay's external address is 127.0.0.2 (relay sockets listen on every address, so loopback
+//! reaches them), which keeps it apart from the peers on 127.0.0.1; most configs allow loopback peers.
 
 use std::{
     net::SocketAddr,
@@ -28,6 +29,7 @@ use tokio::{
 const SECRET: &[u8] = b"turn-test-secret";
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(300);
+const EXTERNAL: &str = "127.0.0.2";
 
 /// Each server gets its own relay ports, so tests can run in parallel.
 static NEXT_RANGE: AtomicU16 = AtomicU16::new(42_000);
@@ -45,7 +47,7 @@ fn config(turn_extra: &str, top: &str) -> Config {
 urls = []
 listen = "127.0.0.1:0"
 relay_ports = "{first}-{last}"
-external_ip = "127.0.0.1"
+external_ip = "{EXTERNAL}"
 {turn_extra}
 
 [apps.game]
@@ -108,9 +110,13 @@ fn xaddr(m: &Message, t: u16) -> SocketAddr {
     stun::xor_addr(m.get(t).expect("address attribute"), &m.tx).unwrap()
 }
 
-/// A UDP peer that echoes everything back.
+/// A UDP peer on 127.0.0.1 that echoes everything back.
 async fn echo_peer() -> SocketAddr {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    echo_at("127.0.0.1").await
+}
+
+async fn echo_at(ip: &str) -> SocketAddr {
+    let sock = UdpSocket::bind((ip, 0)).await.unwrap();
     let addr = sock.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -310,7 +316,7 @@ async fn allocate_after_challenge() {
     let resp = c.allocate().await;
     let m = Message::parse(&resp).unwrap();
     let relayed = xaddr(&m, attr::XOR_RELAYED_ADDRESS);
-    assert_eq!(relayed.ip().to_string(), "127.0.0.1", "external_ip");
+    assert_eq!(relayed.ip().to_string(), EXTERNAL, "external_ip");
     assert!(s.in_range(relayed.port()), "{relayed} in relay_ports");
     assert_eq!(xaddr(&m, attr::XOR_MAPPED_ADDRESS), c.local_addr());
     assert_eq!(m.get(attr::LIFETIME), Some(&600u32.to_be_bytes()[..]));
@@ -363,7 +369,7 @@ async fn stranger_cannot_reach_the_client() {
 
 #[tokio::test]
 async fn relay_to_relay_in_process() {
-    // No allowed_peers: 127.0.0.1 is forbidden as a peer, except as this server's own relay addresses.
+    // No allowed_peers: loopback is forbidden as a peer, except for this server's own relay addresses.
     let s = start("").await;
     let (mut a, mut b) = (Client::udp(&s).await, Client::udp(&s).await);
     let (ra, rb) = (a.relayed().await, b.relayed().await);
@@ -375,6 +381,21 @@ async fn relay_to_relay_in_process() {
     assert_eq!(b.bind(0x4abc, ra).await, None);
     a.send_to_peer(rb, b"by channel").await;
     assert_eq!(stun::parse_channel_data(&b.recv().await), Some((0x4abc, &b"by channel"[..])));
+}
+
+#[tokio::test]
+async fn nothing_else_on_the_external_address() {
+    // A permission for another allocation's relay address is a permission for its IP, which is this host: Send
+    // indications to any other port there must go nowhere.
+    let s = start(LOOPBACK).await; // even with loopback allowed: the external address is special
+    let (mut a, mut b) = (Client::udp(&s).await, Client::udp(&s).await);
+    let rb = b.relayed().await;
+    a.relayed().await;
+    assert_eq!(a.permit(rb).await, None);
+    let service = echo_at(EXTERNAL).await; // a service on the TURN host
+    a.send_to_peer(service, b"probe").await;
+    assert!(a.recv_within(QUIET).await.is_none(), "relayed to a service on external_ip");
+    assert_eq!(s.stats.bytes_out.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -530,10 +551,13 @@ async fn dropping_the_server_frees_allocations() {
     // Lifetimes are at least 600 s, so expiry by the sweeper is unit-tested in allocation.rs instead.
     let s = start(LOOPBACK).await;
     Client::udp(&s).await.relayed().await;
+    let mut tcp = Client::tcp(&s).await;
+    tcp.relayed().await;
     let stats = s.stats.clone();
-    assert_eq!(stats.allocations.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.allocations.load(Ordering::Relaxed), 2);
     drop(s);
     assert_eq!(stats.allocations.load(Ordering::Relaxed), 0);
+    assert!(tcp.recv_within(WAIT).await.is_none(), "TCP connections end with the server");
 }
 
 // ---------------------------------------------------------------------------

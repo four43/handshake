@@ -141,7 +141,7 @@ Keyed by the 5-tuple: for UDP the client address plus the listening socket; for 
   nothing is relayed before auth.
 - **Bandwidth**: per allocation, a token bucket per direction at `kbps_per_allocation`; packets over it are dropped.
 - **Quotas**: `max_allocations`, `allocations_per_ip` (by client IP from the PROXY header when present).
-- **TCP**: a connection must send a complete first message within 10 s (and, from a trusted proxy, its PROXY header);
+- **TCP**: at most `max_allocations` + 256 connections at once (more are closed on accept); a connection must send a complete first message within 10 s (and, from a trusted proxy, its PROXY header);
   without an allocation it is closed after 30 s idle; at most 64 KiB buffered per frame.
 - **PROXY protocol v2**: honored only from peers in `trusted_proxies`, and optional there: a trusted peer's connection
   that starts with the v2 signature (first byte `0x0D`; STUN and ChannelData never start with it) is read as coming
@@ -151,7 +151,8 @@ Keyed by the 5-tuple: for UDP the client address plus the listening socket; for 
 - **Relay to relay on this server**: a Send/ChannelData to `external_ip` at a port in `relay_ports` that belongs to a
   live allocation is delivered in-process, as if that relay socket had received it from the sender's relay address.
   Two relayed players are common (both on cellular), and the alternative depends on the router hairpinning its own
-  WAN address.
+  WAN address. Any other port on `external_ip` is never sent to: permissions are per IP, so a permission for
+  another allocation's relay address would otherwise reach every service on the host.
 
 ## Code layout
 

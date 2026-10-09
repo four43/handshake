@@ -100,6 +100,7 @@ impl TurnServer {
             table: Mutex::new(Table { allocs: HashMap::new(), by_port: HashMap::new(), ports: PortPool::new(range) }),
             stats,
             next_tcp: AtomicU64::new(1),
+            shutdown: tokio::sync::watch::channel(false).0,
         });
 
         let mut tasks = vec![
@@ -121,6 +122,7 @@ impl TurnServer {
 
 impl Drop for TurnServer {
     fn drop(&mut self) {
+        self.shared.shutdown.send_replace(true);
         for t in &self.tasks {
             t.abort();
         }
@@ -219,6 +221,8 @@ struct Shared {
     table: Mutex<Table>, // lock order: table, then an allocation's state
     stats: Arc<Stats>,
     next_tcp: AtomicU64,
+    /// Set when the server is dropped, so TCP connections end too.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 struct Table {
@@ -503,7 +507,7 @@ impl Shared {
         if peer.is_ipv6() && v4(peer.ip()).is_none() {
             return Err((443, "Peer Address Family Mismatch"));
         }
-        // Copy the address out first: holding the `external` lock while taking `table` would invert allocate()'s order.
+        // Never hold `external` and `table` together: allocate() takes them in the other order.
         let external = *self.external.lock().unwrap();
         let own = v4(peer.ip()) == Some(external) && self.table.lock().unwrap().ports.contains(peer.port());
         if own || peer_allowed(peer.ip(), &self.allowed_peers) {
@@ -589,17 +593,20 @@ impl Shared {
     }
 
     /// Send from `alloc`'s relay address to `peer`. A peer that is one of this server's own relay addresses gets the
-    /// data in-process: no trip out and back through the router (which may not hairpin its WAN address).
+    /// data in-process: no trip out and back through the router (which may not hairpin its WAN address). Nothing else
+    /// on `external_ip` is ever sent to: permissions are per IP, so a permission for another allocation's relay address
+    /// would otherwise reach every service on this host.
     fn relay_out(&self, alloc: &Alloc, peer: SocketAddr, data: &[u8]) {
-        self.stats.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
         let external = *self.external.lock().unwrap();
         if v4(peer.ip()) == Some(external) {
             let target = self.table.lock().unwrap().by_port.get(&peer.port()).cloned();
             if let Some(target) = target {
+                self.stats.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
                 on_peer_data(&target, SocketAddr::new(external.into(), alloc.port), data, &self.stats);
-                return;
             }
+            return;
         }
+        self.stats.bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
         let _ = alloc.relay.try_send_to(data, peer);
     }
 }
@@ -721,6 +728,7 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
     let mut proxy_pending = sh.trusted.iter().any(|c| c.contains(peer.ip()));
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut first = true;
+    let mut shutdown = sh.shutdown.subscribe();
     'conn: loop {
         loop {
             if proxy_pending {
@@ -759,7 +767,11 @@ async fn tcp_conn(sh: Arc<Shared>, stream: TcpStream, peer: SocketAddr, id: u64)
         }
         let wait = if first { sh.tuning.tcp_first_message } else { sh.tuning.tcp_idle };
         buf.reserve(4096);
-        match timeout(wait, rd.read_buf(&mut buf)).await {
+        let read = tokio::select! {
+            read = timeout(wait, rd.read_buf(&mut buf)) => read,
+            _ = shutdown.wait_for(|down| *down) => break,
+        };
+        match read {
             Ok(Ok(0)) | Ok(Err(_)) => break,
             Ok(Ok(_)) => {}
             Err(_) if first => break,
