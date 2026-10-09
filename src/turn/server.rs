@@ -21,7 +21,7 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
     time::timeout,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     allocation::{self, peer_allowed, v4, PortPool, State},
@@ -331,6 +331,7 @@ impl Shared {
     fn request(self: &Arc<Self>, msg: &Message, ctx: &Ctx) -> Option<Vec<u8>> {
         let unknown = msg.unknown_required();
         if !unknown.is_empty() {
+            debug!(client = %ctx.client, method = msg.method, ?unknown, "TURN request with unknown attributes");
             let list: Vec<u8> = unknown.iter().flat_map(|t| t.to_be_bytes()).collect();
             return Some(
                 Builder::new(msg.method, Class::Error, msg.tx)
@@ -409,6 +410,12 @@ impl Shared {
         if msg.get(attr::REQUESTED_ADDRESS_FAMILY).is_some_and(|v| v.first() != Some(&1)) {
             return reply.error(440, "Address Family not Supported");
         }
+        // EVEN-PORT: an even relay port. With the R bit it also asks to reserve the next one, which this server does not do.
+        let even = match msg.get(attr::EVEN_PORT) {
+            None => false,
+            Some([r, ..]) if r & 0x80 != 0 => return reply.error(508, "Insufficient Capacity"),
+            Some(_) => true,
+        };
         let same_ip = table.allocs.values().filter(|a| a.client.ip() == ctx.client.ip()).count();
         if same_ip >= self.allocations_per_ip {
             self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
@@ -418,7 +425,7 @@ impl Shared {
             self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
             return reply.error(508, "Insufficient Capacity");
         }
-        let Some((sock, port)) = table.ports.bind() else {
+        let Some((sock, port)) = table.ports.bind(even) else {
             self.stats.quota_rejections.fetch_add(1, Ordering::Relaxed);
             return reply.error(508, "Insufficient Capacity");
         };

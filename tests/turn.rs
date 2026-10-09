@@ -504,12 +504,25 @@ async fn unsupported_requests() {
     let v6 = c.authed(method::ALLOCATE, |b| b.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).attr(attr::REQUESTED_ADDRESS_FAMILY, &[2, 0, 0, 0]));
     assert_eq!(error_code(&Message::parse(&c.call(v6).await).unwrap()), Some(440));
 
-    let even = c.authed(method::ALLOCATE, |b| b.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).attr(attr::EVEN_PORT, &[0x80, 0, 0, 0]));
-    let resp = c.call(even).await;
+    let reserve = c.authed(method::ALLOCATE, |b| b.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).attr(attr::EVEN_PORT, &[0x80, 0, 0, 0]));
+    assert_eq!(error_code(&Message::parse(&c.call(reserve).await).unwrap()), Some(508), "no port reservations");
+    let token = c.authed(method::ALLOCATE, |b| b.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).attr(attr::RESERVATION_TOKEN, &[0; 8]));
+    let resp = c.call(token).await;
     let m = Message::parse(&resp).unwrap();
     assert_eq!(error_code(&m), Some(420));
-    assert_eq!(m.get(attr::UNKNOWN_ATTRIBUTES), Some(&attr::EVEN_PORT.to_be_bytes()[..]));
+    assert_eq!(m.get(attr::UNKNOWN_ATTRIBUTES), Some(&attr::RESERVATION_TOKEN.to_be_bytes()[..]));
     assert_eq!(s.allocations(), 0);
+
+    // EVEN-PORT without the R bit (coturn's test client sends it) is just an even port.
+    for _ in 0..3 {
+        let mut c = Client::udp(&s).await;
+        let first = c.call(Builder::new(method::ALLOCATE, Class::Request, tx()).attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).finish(None)).await;
+        c.nonce = Message::parse(&first).unwrap().get(attr::NONCE).unwrap().to_vec();
+        let even = c.authed(method::ALLOCATE, |b| b.attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0]).attr(attr::EVEN_PORT, &[0, 0, 0, 0]));
+        let resp = c.call(even).await;
+        let port = xaddr(&Message::parse(&resp).unwrap(), attr::XOR_RELAYED_ADDRESS).port();
+        assert_eq!(port % 2, 0, "{port}");
+    }
 }
 
 #[tokio::test]

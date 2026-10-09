@@ -30,7 +30,8 @@ In:
 Out:
 
 - TLS or DTLS inside Handshake (the proxy does TLS; browsers do not use DTLS TURN).
-- TCP relaying (RFC 6062), IPv6 relay addresses, EVEN-PORT / RESERVATION-TOKEN. Browsers do not ask for them.
+- TCP relaying (RFC 6062), IPv6 relay addresses, port reservations (EVEN-PORT with R=1, RESERVATION-TOKEN). Browsers do
+  not ask for them. EVEN-PORT without R (coturn's test client sends it) gets an even port.
 - Room-scoped relaying (only relay between members of one room). A good follow-up: TURN now lives in the process
   that knows the rooms.
 - Client library changes. The client already takes its ICE servers from `/turn`.
@@ -89,6 +90,7 @@ STUN messages (RFC 8489): 20-byte header (type, length, magic cookie `0x2112A442
 | USERNAME, REALM, NONCE, MESSAGE-INTEGRITY, FINGERPRINT | Auth and integrity |
 | ERROR-CODE, SOFTWARE | Responses |
 | DONT-FRAGMENT | Accepted and ignored |
+| EVEN-PORT | R=0: an even relay port; R=1 (reserve the next port too): 508 |
 | any other comprehension-required (< 0x8000) | 420 with UNKNOWN-ATTRIBUTES |
 
 Every response carries FINGERPRINT (CRC32 xor `0x5354554E`). Requests with a FINGERPRINT are checked.

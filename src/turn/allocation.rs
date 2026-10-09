@@ -157,13 +157,14 @@ impl PortPool {
         (self.range.first..=self.range.last).contains(&port)
     }
 
-    /// Bind a non-blocking UDP socket on a free port of the range, or `None` when every port is taken.
-    pub fn bind(&mut self) -> Option<(UdpSocket, u16)> {
+    /// Bind a non-blocking UDP socket on a free port of the range (an even one if `even`, for EVEN-PORT), or `None`
+    /// when every such port is taken.
+    pub fn bind(&mut self, even: bool) -> Option<(UdpSocket, u16)> {
         let size = (self.range.last - self.range.first) as u32 + 1;
         for _ in 0..size {
             let port = self.next;
             self.next = if port == self.range.last { self.range.first } else { port + 1 };
-            if self.used.contains(&port) {
+            if self.used.contains(&port) || (even && port % 2 == 1) {
                 continue;
             }
             // Another process may hold the port; then try the next.
@@ -269,17 +270,18 @@ mod tests {
         // A high range the OS is unlikely to hand out at the same moment.
         let mut pool = PortPool::new(PortRange { first: 61_111, last: 61_113 });
         let mut got = Vec::new();
-        while let Some((sock, port)) = pool.bind() {
+        while let Some((sock, port)) = pool.bind(false) {
             assert!(pool.contains(port));
             got.push((sock, port));
         }
         let mut ports: Vec<u16> = got.iter().map(|(_, p)| *p).collect();
         ports.sort();
         assert_eq!(ports, [61_111, 61_112, 61_113]);
-        let (sock, port) = got.remove(1);
+        let (sock, port) = got.remove(0); // 61111
         drop(sock);
         pool.release(port);
-        assert_eq!(pool.bind().map(|(_, p)| p), Some(port));
+        assert!(pool.bind(true).is_none(), "the free port is odd");
+        assert_eq!(pool.bind(false).map(|(_, p)| p), Some(port));
         assert!(!pool.contains(61_110));
     }
 }

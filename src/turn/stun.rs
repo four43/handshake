@@ -56,7 +56,7 @@ pub mod attr {
 }
 
 /// Comprehension-required attributes (type < 0x8000) this server understands. Anything else in a request gets a 420.
-/// EVEN-PORT and RESERVATION-TOKEN are left out on purpose: browsers never send them and the server does not honor them.
+/// RESERVATION-TOKEN is left out on purpose: the server reserves no ports (EVEN-PORT with R=1 gets a 508 instead).
 const KNOWN: &[u16] = &[
     attr::MAPPED_ADDRESS,
     attr::USERNAME,
@@ -71,6 +71,7 @@ const KNOWN: &[u16] = &[
     attr::NONCE,
     attr::XOR_RELAYED_ADDRESS,
     attr::REQUESTED_ADDRESS_FAMILY,
+    attr::EVEN_PORT,
     attr::REQUESTED_TRANSPORT,
     attr::DONT_FRAGMENT,
     attr::XOR_MAPPED_ADDRESS,
@@ -505,10 +506,11 @@ mod tests {
         let buf = Builder::new(method::ALLOCATE, Class::Request, [0; 12])
             .attr(attr::REQUESTED_TRANSPORT, &[17, 0, 0, 0])
             .attr(attr::EVEN_PORT, &[0x80])
+            .attr(attr::RESERVATION_TOKEN, &[0; 8])
             .attr(0x7777, b"x")
             .attr(0xC001, b"optional")
             .finish(None);
-        assert_eq!(Message::parse(&buf).unwrap().unknown_required(), vec![attr::EVEN_PORT, 0x7777]);
+        assert_eq!(Message::parse(&buf).unwrap().unknown_required(), vec![attr::RESERVATION_TOKEN, 0x7777]);
     }
 
     #[test]

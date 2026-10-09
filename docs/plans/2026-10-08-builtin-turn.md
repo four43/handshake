@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - External coturn deployments keep working: without `relay_ports` nothing new starts and `TURN_SECRET` behaves as before.
-- No TLS/DTLS in Handshake. No TCP relaying, no IPv6 relay addresses, no EVEN-PORT/RESERVATION-TOKEN.
+- No TLS/DTLS in Handshake. No TCP relaying, no IPv6 relay addresses, no port reservations (EVEN-PORT R=1, RESERVATION-TOKEN).
 - One new runtime dependency: `md-5`. CRC32 is hand-written.
 - Run Rust tests with `scripts/test.sh` (filter: `scripts/test.sh turn`). Never install cargo on the host. `UPDATE_SCHEMAS=1 scripts/test.sh schemas_are_current` after config changes.
 - Commits: conventional (`feat:`, `test:`, `docs:` …), **no `Co-Authored-By` and no Claude attribution**.
