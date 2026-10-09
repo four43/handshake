@@ -383,6 +383,19 @@ async fn turn_credentials() {
 }
 
 #[tokio::test]
+async fn builtin_turn_session() {
+    // relay_ports selects the built-in server; the secret main.rs generates arrives like TURN_SECRET does.
+    let config = BASE_CONFIG.replace("ttl_secs = 600", "ttl_secs = 600\nrelay_ports = \"49160-49200\"\nexternal_ip = \"203.0.113.5\"");
+    let cfg: Config = toml::from_str(&config).unwrap();
+    assert!(cfg.turn.as_ref().unwrap().builtin());
+    let s = start_with(&config, Some("generated-at-startup")).await;
+    assert_eq!(s.session("game", 1, Some("https://game.test")).await.json::<Value>().await.unwrap()["turn"], true);
+    let token = s.token("game", 1).await;
+    let body: Value = s.http.post(s.url("/turn")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["ice_servers"][0]["urls"], json!(["stun:turn.test:3478", "turn:turn.test:3478?transport=udp"]));
+}
+
+#[tokio::test]
 async fn turn_rejections() {
     let s = start().await;
     let post = |auth: Option<String>| {

@@ -1,0 +1,18 @@
+services:
+  caddy:
+    build: .
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro"]
+  hs:
+    image: ${IMAGE:-handshake:turns-caddy}
+    environment:
+      SESSION_SECRET: caddy-check-session-secret-0123456789ab
+      TURN_SECRET: caddy-check-turn-secret
+    volumes: ["${CONFIG_DIR}/config.toml:/etc/handshake/config.toml:ro"]
+  echo:
+    image: alpine/socat
+    command: ["UDP-RECVFROM:9000,fork", "EXEC:cat"]
+  check:
+    image: python:3-alpine
+    profiles: [check]
+    volumes: ["./turns_check.py:/turns_check.py:ro"]
+    command: ["python", "/turns_check.py"]

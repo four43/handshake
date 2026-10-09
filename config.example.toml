@@ -1,6 +1,6 @@
 # handshake configuration. Secrets come from env vars, never this file:
 #   SESSION_SECRET (required, 32+ chars), SESSION_SECRET_PREV (optional, for rotation)
-#   TURN_SECRET (must match coturn's static-auth-secret)
+#   TURN_SECRET (optional with the built-in TURN server; with an external coturn, its static-auth-secret)
 
 listen = "0.0.0.0:8080"
 # X-Forwarded-For is believed only from these peers (your reverse proxy); from anyone else the
@@ -23,9 +23,18 @@ urls = [
   "stun:turn.example.com:3478",
   "turn:turn.example.com:3478?transport=udp",
   "turn:turn.example.com:3478?transport=tcp",
-  "turns:turn.example.com:443?transport=tcp",
+  "turns:turn.example.com:443?transport=tcp",   # TLS terminated by your reverse proxy (see the self-hosting guide)
 ]
 ttl_secs = 3600
+# The built-in TURN server starts when relay_ports is set. Leave relay_ports and the rest out to mint credentials
+# for an external coturn instead.
+listen = "0.0.0.0:3478"            # TURN over UDP and TCP
+relay_ports = "49160-49200"        # UDP, one per allocation; open them (and 3478) to the internet
+external_ip = "203.0.113.10"       # public IPv4, or a hostname that resolves to it (re-resolved every minute)
+max_allocations = 500
+allocations_per_ip = 64
+kbps_per_allocation = 2000
+# allowed_peers = []               # private ranges the relay may send to anyway (tests, LAN-only setups)
 
 [apps.pig-pens]
 origins = ["https://seth.github.io"]

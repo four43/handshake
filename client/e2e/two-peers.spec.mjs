@@ -44,3 +44,33 @@ test('host and guest connect, talk on both channels and survive a socket drop', 
 
   for (const p of [host, guest]) await p.evaluate(() => hs.close());
 });
+
+// Both pages connect only through the server's built-in TURN relay, once per transport.
+for (const transport of ['udp', 'tcp']) {
+  test(`host and guest connect through the TURN relay over ${transport}`, async ({ browser }) => {
+    const host = await (await browser.newContext()).newPage();
+    const guest = await (await browser.newContext()).newPage();
+    for (const p of [host, guest]) { await p.goto(`/e2e/page.html?relay=${transport}`); await p.waitForFunction(() => window.ready); }
+
+    const code = await host.evaluate(async () => {
+      window.hs = make();
+      window.room = await hs.createRoom({ public: true });
+      room.on('peer', peer => { window.peer = peer; listen(peer); });
+      return room.code;
+    });
+    await guest.evaluate(async code => {
+      window.hs = make();
+      window.room = await hs.joinRoom(code);
+      await new Promise(resolve => room.on('peer', peer => { window.peer = peer; listen(peer); resolve(); }));
+    }, code);
+    await host.waitForFunction(() => window.peer?.open);
+
+    await guest.evaluate(() => { for (let i = 0; i < 20; i++) peer.send(new Uint8Array([4, 5, 6])); });
+    await host.waitForFunction(() => got.some(m => !m.reliable && m.data.join() === '4,5,6'));
+    await host.evaluate(() => peer.send({ via: 'relay' }, { reliable: true }));
+    await guest.waitForFunction(() => got.some(m => m.reliable && m.data.via === 'relay'));
+    for (const p of [host, guest]) await p.waitForFunction(() => peer.connectionType === 'relayed');
+
+    for (const p of [host, guest]) await p.evaluate(() => hs.close());
+  });
+}

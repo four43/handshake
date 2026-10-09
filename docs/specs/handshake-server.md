@@ -13,12 +13,12 @@ In scope:
 - Room registry: create, join by code or QR link, public listing, host lock, lifecycle
 - Signaling relay: opaque SDP/ICE blobs routed between host and peers
 - Per-app namespacing and lightweight auth (origin allowlist + short-lived session tokens)
-- Short-lived TURN credential minting for a companion coturn server
+- A built-in TURN relay (STUN, TURN over UDP and TCP) and short-lived credentials for it; see `builtin-turn.md`
 - A shared plain-JavaScript client library used by every game
 
 Out of scope:
 
-- Relaying game traffic (that is TURN's job when direct connections fail)
+- Looking inside game traffic (the TURN relay forwards encrypted WebRTC packets it cannot read)
 - Persistence, accounts, matchmaking by skill, horizontal scaling
 - Offline / no-internet play
 
@@ -26,30 +26,27 @@ Out of scope:
 
 &#91;embedded content: deployment · GitHub Pages, players, one Docker host\]
 
-The game is static on GitHub Pages; one self-hosted Docker host runs Caddy, the Rust server and coturn. Only signaling and TURN credentials touch the Rust server.
+The game is static on GitHub Pages; one self-hosted Docker host runs Caddy and the Rust server, which is also the TURN relay. Signaling, TURN credentials and relayed traffic for players who cannot connect directly touch the Rust server.
 
 - **Caddy** terminates TLS for `https://signal.<domain>` with automatic certificates and proxies `/session`, `/turn` and `/ws` to the Rust container on port 8080. `/metrics` is not proxied.
 - **handshake** is a single Rust binary (axum + tokio) in a distroless image. It reads `config.toml` and secrets from environment variables.
-- **coturn** runs with `network_mode: host`, because large UDP port ranges map badly through Docker. Set `external-ip` if the box is behind NAT, narrow the relay range (for example 49160–49200), and reuse Caddy's certificate for `turns:` on 443.
+- **TURN** is built into the Rust server (`builtin-turn.md`): 3478 over UDP and TCP plus a narrow relay range (for example 49160–49200), published from the container; `external_ip` is the public address. `turns:` on 443 is terminated by Caddy with the caddy-l4 plugin, which forwards plain TURN with a PROXY protocol v2 header.
 
 ```yaml
 services:
   caddy:
-    image: caddy:2
+    build: ./caddy-l4        # caddy:2 plus github.com/mholt/caddy-l4, for turns: on 443
     ports: ["80:80", "443:443"]
     volumes: ["./Caddyfile:/etc/caddy/Caddyfile", "caddy_data:/data"]
   signal:
     build: ./handshake
     environment:
       SESSION_SECRET: ${SESSION_SECRET}
-      TURN_SECRET: ${TURN_SECRET}
     volumes: ["./config.toml:/etc/handshake/config.toml:ro"]
-  coturn:
-    image: coturn/coturn
-    network_mode: host
+    ports: ["3478:3478/udp", "3478:3478/tcp", "49160-49200:49160-49200/udp"]
 ```
 
-If coturn needs port 443 for `turns:` on the same IP as Caddy, give coturn a second IP or hostname, or use 5349 and accept that some firewalls block it.
+Caddy keeps 443 for every site; its layer4 listener wrapper hands connections whose SNI is the TURN hostname to the relay, so `turns:` needs no second IP.
 
 ## Apps and auth
 
@@ -90,7 +87,7 @@ turn = true
 1. **Origin allowlist.** `POST /session` and the WebSocket upgrade both require an `Origin` header matching the app's list. Browsers cannot forge `Origin`; scripts can.
 2. **Session token.** `/session` returns an HMAC-SHA256-signed token carrying app ID, protocol version and expiry (default 15 minutes). The WebSocket `hello` and `/turn` both require it.
 3. **Rate limits.** Per-IP limits on session minting and join attempts blunt scripted abuse and code brute-forcing. A per-app limit on failed joins and peeks (`not_found`, `bad_key`) across all IPs stops a guesser with many addresses; when it is hit, joins and peeks for that app return `rate_limited` until the minute rolls over. The client IP is the socket address, or the last untrusted `X-Forwarded-For` entry when the socket comes from `trusted_proxies` (loopback and private networks by default), so per-IP limits hold with or without a proxy in front and cannot be dodged by sending the header directly.
-4. **TURN quota.** TURN usernames encode expiry and app ID, so coturn logs attribute relay usage per app. Cloudflare Turnstile before `/session` is the upgrade path if abuse appears.
+4. **TURN quota.** TURN usernames encode expiry and app ID. The relay caps allocations per client IP and in total, caps bandwidth per allocation, and never relays into private, loopback or link-local addresses. Cloudflare Turnstile before `/session` is the upgrade path if abuse appears.
 
 ### Path-based apps share an origin
 
@@ -99,7 +96,7 @@ Most apps live at different paths on `https://seth.github.io`. `Origin` never ca
 ### Secrets
 
 - `SESSION_SECRET` (required) signs session tokens. `SESSION_SECRET_PREV` is also accepted for verification, so keys rotate without logging everyone out.
-- `TURN_SECRET` must match coturn's `static-auth-secret`.
+- `TURN_SECRET` is optional with the built-in relay (a random one is made at startup); with an external coturn it must match its `static-auth-secret`.
 - `allow_localhost = true` in config accepts `http://localhost:*` and `http://127.0.0.1:*` for every app. Use it for development only.
 
 ## Rooms
@@ -215,7 +212,7 @@ TURN is essential, not a fallback: players on cellular carrier-grade NAT or stri
 
 - **Credentials** follow coturn's `use-auth-secret` scheme. Username is `<expiry unix>:<app id>`; credential is base64 HMAC-SHA1 of the username keyed by `TURN_SECRET`. Default TTL is 1 hour.
 - **URLs** offered, all from config: `stun:` and `turn:` on 3478 (UDP and TCP), plus `turns:` on 443 for networks that block everything but HTTPS.
-- **Per-app quotas** come from coturn (`user-quota`, `total-quota`, `max-bps`), attributed by the app ID in the username.
+- **Quotas** come from the built-in relay: `max_allocations`, `allocations_per_ip` and `kbps_per_allocation` under `[turn]`.
 - **Client isolation** on guest and office Wi-Fi blocks device-to-device traffic even on one LAN; TURN covers it.
 - **Network changes.** When an iPhone hops between Wi-Fi and cellular, the client calls `restartIce()` and re-signals over the still-open WebSocket.
 - **Diagnostics.** The client reads `getStats()` and reports whether the selected candidate pair is direct or relayed, so games can show a connection badge.

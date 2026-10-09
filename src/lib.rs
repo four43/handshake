@@ -31,7 +31,7 @@ use axum::{
     Json, Router,
 };
 use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::URL_SAFE_NO_PAD,
     Engine,
 };
 use futures_util::{stream::SplitStream, SinkExt, StreamExt};
@@ -39,11 +39,12 @@ use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha1::Sha1;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
+
+pub mod turn;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -135,7 +136,8 @@ impl Default for Limits {
     }
 }
 
-/// The companion coturn server. Its `static-auth-secret` must equal `TURN_SECRET`.
+/// The TURN relay. With `relay_ports` set, Handshake runs it itself (docs/specs/builtin-turn.md); without, it mints
+/// credentials for an external coturn whose `static-auth-secret` equals `TURN_SECRET`.
 #[derive(Deserialize, Clone)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct TurnConfig {
@@ -144,6 +146,90 @@ pub struct TurnConfig {
     /// Lifetime of a TURN credential, in seconds.
     #[serde(default = "default_turn_ttl")]
     pub ttl_secs: u64,
+    /// Built-in server: address and port for TURN over UDP and TCP.
+    #[serde(default = "default_turn_listen")]
+    pub listen: String,
+    /// Built-in server: UDP ports for relay addresses, one per allocation, e.g. `"49160-49200"`. Setting it starts
+    /// the built-in server.
+    #[serde(default)]
+    pub relay_ports: Option<PortRange>,
+    /// Built-in server: the public IPv4 address clients and peers reach the relay ports on, or a hostname that
+    /// resolves to it (re-resolved every minute, for a home connection whose address changes). Required with
+    /// `relay_ports`.
+    #[serde(default)]
+    pub external_ip: Option<String>,
+    /// Built-in server: most allocations at once.
+    #[serde(default = "default_max_allocations")]
+    pub max_allocations: usize,
+    /// Built-in server: most allocations per client IP. A relay-only host needs about three per guest (UDP, TCP, TLS).
+    #[serde(default = "default_allocations_per_ip")]
+    pub allocations_per_ip: usize,
+    /// Built-in server: relayed traffic per allocation and direction, in kilobits per second. Packets over it are dropped.
+    #[serde(default = "default_kbps_per_allocation")]
+    pub kbps_per_allocation: u32,
+    /// Built-in server: peer ranges the relay may send to although they are private, loopback or otherwise forbidden.
+    #[serde(default)]
+    pub allowed_peers: Vec<Cidr>,
+}
+
+impl TurnConfig {
+    /// True when Handshake runs the TURN server itself.
+    pub fn builtin(&self) -> bool {
+        self.relay_ports.is_some()
+    }
+}
+
+/// A range of ports such as `49160-49200`, both ends included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl std::str::FromStr for PortRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("not a port range: {s:?} (expected e.g. \"49160-49200\")");
+        let (a, b) = s.split_once('-').ok_or_else(bad)?;
+        let (first, last): (u16, u16) = (a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?);
+        if first == 0 || first > last {
+            return Err(bad());
+        }
+        Ok(PortRange { first, last })
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.first, self.last)
+    }
+}
+
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+impl serde::Serialize for PortRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+#[cfg(test)]
+impl schemars::JsonSchema for PortRange {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "PortRange".into()
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string" })
+    }
 }
 
 /// What `list` returns for an app.
@@ -270,6 +356,18 @@ pub fn default_listen() -> String {
 fn default_turn_ttl() -> u64 {
     3600
 }
+fn default_turn_listen() -> String {
+    "0.0.0.0:3478".into()
+}
+fn default_max_allocations() -> usize {
+    500
+}
+fn default_allocations_per_ip() -> usize {
+    64
+}
+fn default_kbps_per_allocation() -> u32 {
+    2000
+}
 fn default_max_players() -> u8 {
     8
 }
@@ -291,6 +389,7 @@ pub struct App {
     turn_key: Option<Vec<u8>>,
     inner: Mutex<Inner>,
     metrics: Metrics,
+    turn_stats: Arc<turn::Stats>,
     next_conn: AtomicU64,
 }
 
@@ -651,12 +750,18 @@ impl App {
             turn_key,
             inner: Mutex::new(Inner::default()),
             metrics: Metrics::default(),
+            turn_stats: Arc::default(),
             next_conn: AtomicU64::new(1),
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The built-in TURN server's counters, rendered by `/metrics`; hand them to [`turn::TurnServer::start`].
+    pub fn turn_stats(&self) -> Arc<turn::Stats> {
+        self.turn_stats.clone()
     }
 
     fn grace(&self) -> Duration {
@@ -1146,7 +1251,7 @@ async fn turn(State(s): State<Arc<App>>, headers: HeaderMap) -> Response {
     };
     // coturn use-auth-secret: username "<expiry>:<anything>", password b64(HMAC-SHA1(secret, username)).
     let username = format!("{}:{}", now_unix() + tc.ttl_secs, claims.a);
-    let credential = turn_credential(key, &username);
+    let credential = turn::auth::password(key, &username);
     s.metrics.turn.fetch_add(1, Ordering::Relaxed);
     Json(json!({
         "ice_servers": [{ "urls": tc.urls, "username": username, "credential": credential }],
@@ -1166,6 +1271,21 @@ async fn metrics(State(s): State<Arc<App>>) -> String {
     ];
     for (name, kind, value) in counters {
         let _ = writeln!(out, "# TYPE {name} {kind}\n{name} {value}");
+    }
+    if s.cfg.turn.as_ref().is_some_and(|t| t.builtin()) {
+        let t = &s.turn_stats;
+        let turn = [
+            ("handshake_turn_allocations", "gauge", t.allocations.load(Ordering::Relaxed)),
+            ("handshake_turn_allocations_total", "counter", t.allocations_total.load(Ordering::Relaxed)),
+            ("handshake_turn_auth_failures_total", "counter", t.auth_failures.load(Ordering::Relaxed)),
+            ("handshake_turn_quota_rejections_total", "counter", t.quota_rejections.load(Ordering::Relaxed)),
+        ];
+        for (name, kind, value) in turn {
+            let _ = writeln!(out, "# TYPE {name} {kind}\n{name} {value}");
+        }
+        let _ = writeln!(out, "# TYPE handshake_turn_relayed_bytes_total counter");
+        let _ = writeln!(out, "handshake_turn_relayed_bytes_total{{direction=\"in\"}} {}", t.bytes_in.load(Ordering::Relaxed));
+        let _ = writeln!(out, "handshake_turn_relayed_bytes_total{{direction=\"out\"}} {}", t.bytes_out.load(Ordering::Relaxed));
     }
     let inner = s.inner.lock().unwrap();
     let _ = writeln!(out, "# TYPE handshake_rooms gauge");
@@ -1308,13 +1428,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
-}
-
-/// coturn use-auth-secret password: base64(HMAC-SHA1(secret, username)).
-fn turn_credential(key: &[u8], username: &str) -> String {
-    let mut mac = <Hmac<Sha1>>::new_from_slice(key).expect("hmac accepts any key length");
-    mac.update(username.as_bytes());
-    STANDARD.encode(mac.finalize().into_bytes())
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -1533,6 +1646,9 @@ mod tests {
         assert_eq!(tp.list, ListMode::Hidden);
         assert_eq!(cfg.apps["pig-pens"].list, ListMode::All);
         assert_eq!(cfg.limits.grace_secs, 30);
+        let turn = cfg.turn.unwrap();
+        assert!(turn.builtin());
+        assert_eq!((turn.relay_ports, turn.external_ip.as_deref()), (Some(PortRange { first: 49160, last: 49200 }), Some("203.0.113.10")));
     }
 
     // ---- session tokens -------------------------------------------------
@@ -1605,19 +1721,6 @@ mod tests {
         for junk in ["", ".", "nodot", &format!("{payload}."), &format!(".{sig}"), "!!!.???"] {
             assert!(app.verify_token(junk).is_none(), "{junk:?}");
         }
-    }
-
-    // ---- TURN -----------------------------------------------------------
-
-    #[test]
-    fn turn_credential_matches_coturn_scheme() {
-        // Known-answer HMAC-SHA1, computed independently:
-        //   printf '1700000000:game' | openssl dgst -sha1 -hmac turn-secret -binary | base64
-        assert_eq!(turn_credential(b"turn-secret", "1700000000:game"), "n12nWdEgEYR9Wpg+vbxX8n3V8VA=");
-        // 20-byte SHA1 digest -> 28 base64 chars with padding.
-        let cred = turn_credential(b"k", "1:a");
-        assert_eq!(STANDARD.decode(&cred).unwrap().len(), 20);
-        assert_ne!(cred, turn_credential(b"k", "2:a"));
     }
 
     // ---- codes, names, ids ----------------------------------------------
@@ -1714,6 +1817,25 @@ mod tests {
         rate.insert((a, "join"), (Instant::now() - Duration::from_secs(61), 99));
         assert!(rate_allow(&mut rate, a, "join", 3));
         assert_eq!(rate[&(a, "join")].1, 1);
+    }
+
+    #[test]
+    fn port_range_parses() {
+        assert_eq!("49160-49200".parse(), Ok(PortRange { first: 49160, last: 49200 }));
+        assert_eq!("5-5".parse(), Ok(PortRange { first: 5, last: 5 }));
+        for bad in ["", "5", "2-1", "0-5", "a-b", "1-70000", "1-2-3"] {
+            assert!(bad.parse::<PortRange>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn turn_config_defaults() {
+        let tc: TurnConfig = toml::from_str(r#"urls = []"#).unwrap();
+        assert!(!tc.builtin());
+        assert_eq!((tc.listen.as_str(), tc.ttl_secs, tc.max_allocations, tc.allocations_per_ip, tc.kbps_per_allocation), ("0.0.0.0:3478", 3600, 500, 64, 2000));
+        let tc: TurnConfig = toml::from_str("urls = []\nrelay_ports = \"49160-49200\"\nexternal_ip = \"203.0.113.5\"").unwrap();
+        assert!(tc.builtin());
+        assert!(toml::from_str::<TurnConfig>("urls = []\nrelay_ports = \"9-1\"").is_err());
     }
 
     #[test]

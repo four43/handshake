@@ -52,7 +52,7 @@ import * as art from '../../components/features';
       The server only relays connection setup. Game data flows host ↔ guest over WebRTC data channels and never touches it.
     </Feature>
     <Feature title="TURN when it must" art="Two players connected through a relay" {...art.turn}>
-      Short-lived coturn credentials for players on cellular or strict Wi-Fi, and relay-only links to strangers so nobody learns anyone's IP.
+      A built-in TURN relay for players on cellular or strict Wi-Fi, and relay-only links to strangers so nobody learns anyone's IP.
     </Feature>
     <Feature title="Survives iPhones" art="A dropped player reconnecting to the host" {...art.resume}>
       Sockets drop all the time on phones. Members keep their seat for a grace period and resume automatically, with ICE restarts and a wake lock.

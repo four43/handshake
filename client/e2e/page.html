@@ -9,6 +9,15 @@
   window.got = [];
   window.listen = peer => peer.on('message', (d, { reliable }) =>
     window.got.push({ reliable, data: d instanceof ArrayBuffer ? [...new Uint8Array(d)] : d }));
-  window.make = () => new Handshake({ server: 'http://127.0.0.1:18080', app: 'e2e', version: 1, WebSocket: TrackedWebSocket, wakeLock: false });
+  // ?relay=udp|tcp: connect only through the server's TURN relay, over that transport (the client offers both).
+  const relay = new URLSearchParams(location.search).get('relay');
+  const relayOnly = c => ({ ...c, iceTransportPolicy: 'relay',
+    iceServers: (c?.iceServers ?? []).map(s => ({ ...s, urls: [].concat(s.urls).filter(u => u.endsWith(`transport=${relay}`)) })) });
+  class RelayOnly extends RTCPeerConnection {
+    constructor(c) { super(relayOnly(c)); }
+    setConfiguration(c) { super.setConfiguration(relayOnly(c)); }
+  }
+  window.make = () => new Handshake({ server: 'http://127.0.0.1:18080', app: 'e2e', version: 1, WebSocket: TrackedWebSocket, wakeLock: false,
+    ...(relay ? { RTCPeerConnection: RelayOnly } : {}) });
   window.ready = true;
 </script>

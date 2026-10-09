@@ -9,4 +9,13 @@ grace_secs = 30
 origins = []
 max_players = 4
 public_rooms = true
-turn = false
+turn = true
+
+# The built-in TURN server, published on 127.0.0.1 by run.sh. Both pages relay through it, so relay to relay stays
+# in-process and the relay ports need no publishing; loopback must be an allowed peer.
+[turn]
+urls = ["turn:127.0.0.1:3478?transport=udp", "turn:127.0.0.1:3478?transport=tcp"]
+listen = "0.0.0.0:3478"
+relay_ports = "49160-49169"
+external_ip = "127.0.0.1"
+allowed_peers = ["127.0.0.0/8"]

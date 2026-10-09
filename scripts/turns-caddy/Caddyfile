@@ -1,0 +1,30 @@
+# The self-hosting guide's turns: setup, with test hostnames and Caddy's internal CA instead of Let's Encrypt.
+{
+	servers :443 {
+		listener_wrappers {
+			layer4 {
+				@turn tls sni turn.test
+				route @turn {
+					tls
+					proxy {
+						proxy_protocol v2
+						upstream tcp/hs:3478
+					}
+				}
+			}
+			tls
+		}
+	}
+}
+
+# Only here so Caddy holds a certificate for the TURN hostname.
+turn.test {
+	tls internal
+	respond 404
+}
+
+# Another site on the same :443, which must keep working.
+site.test {
+	tls internal
+	respond "site ok"
+}

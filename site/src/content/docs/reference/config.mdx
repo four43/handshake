@@ -13,7 +13,7 @@ The server reads `config.toml` from the path in the `CONFIG` environment variabl
 | --- | --- |
 | `SESSION_SECRET` | Required, 32+ characters. Signs session tokens. |
 | `SESSION_SECRET_PREV` | Optional. Also accepted when verifying, so you can rotate the secret without logging everyone out. |
-| `TURN_SECRET` | Must match coturn's `static-auth-secret`. Needed when `[turn]` is set. |
+| `TURN_SECRET` | Optional with the built-in TURN server (`relay_ports` set): Handshake makes one up at startup. With an external coturn it must match coturn's `static-auth-secret`. |
 
 ## Keys
 
